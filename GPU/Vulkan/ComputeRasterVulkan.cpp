@@ -128,6 +128,9 @@ public:
 	PrimWords &Prims() override {
 		return prims_;
 	}
+	bool BatchFull() const override {
+		return prims_.size() > MAX_BATCH_PRIM_WORDS || uploadData_.size() > MAX_BATCH_UPLOAD_BYTES || scratchUsed_ > SCRATCH_SIZE - 128 * 1024;
+	}
 	void CommitPrim(uint32_t offset, const Rasterizer::RasterizerState &state) override;
 	void EndSegment() override;
 	void BeginSnapshot() override;
@@ -384,6 +387,8 @@ bool ComputeRasterVulkan::Init() {
 	gpuDirty_.assign((MEM_VRAM_SIZE >> PAGE_SHIFT) / 32, 0);
 	tileCount_.assign(TILES_X * TILES_Y, 0);
 	tilePos_.assign(TILES_X * TILES_Y, 0);
+	// Enough for a busy frame.
+	prims_.reserve(4 * 1024 * 1024);
 
 	// The copy starts out zero, as the shadow does.
 	VkCommandBuffer cmd = renderManager_->GetInitCmd();
@@ -633,7 +638,7 @@ void ComputeRasterVulkan::ResolveLevel(const Rasterizer::RasterizerState &state,
 
 uint32_t ComputeRasterVulkan::PackState(const Rasterizer::RasterizerState &state, bool snapshot) {
 	using namespace Rasterizer;
-	if (prims_.size() > MAX_BATCH_PRIM_WORDS || uploadData_.size() > MAX_BATCH_UPLOAD_BYTES || scratchUsed_ > SCRATCH_SIZE - 128 * 1024)
+	if (BatchFull())
 		Submit();
 
 	const uint32_t index = (uint32_t)(states_.size() / ST_WORDS);
@@ -736,7 +741,9 @@ void ComputeRasterVulkan::CommitPrim(uint32_t offset, const Rasterizer::Rasteriz
 	const PixelFuncID &id = state.pixelID;
 	const uint32_t bpp = id.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
 	const uint32_t fbStride = id.cached.framebufStride;
-	const uint32_t fbAddr = gstate.getFrameBufAddress() & (MEM_VRAM_SIZE - 1);
+	// The buffers as they were packed: gstate may have moved on to the next ones already.
+	const uint32_t *st = &states_[prims_[offset + PRIM_STATE] * ST_WORDS];
+	const uint32_t fbAddr = st[ST_FB_ADDR];
 	const uint32_t colorStart = fbAddr + (x1 + y1 * fbStride) * bpp;
 	const uint32_t colorEnd = fbAddr + (x2 + y2 * fbStride) * bpp + bpp;
 	VerifyVRAM(colorStart, colorEnd - colorStart);
@@ -745,8 +752,9 @@ void ComputeRasterVulkan::CommitPrim(uint32_t offset, const Rasterizer::Rasteriz
 	const bool depthRead = !id.clearMode && id.DepthTestFunc() != GE_COMP_ALWAYS;
 	if (depthRead || id.depthWrite) {
 		const uint32_t zStride = id.cached.depthbufStride;
-		const uint32_t zStart = (depthbuf.base + (x1 + y1 * zStride) * 2) & ~(DEPTH_BLOCK - 1);
-		const uint32_t zEnd = (depthbuf.base + (x2 + y2 * zStride) * 2 + 2 + DEPTH_BLOCK - 1) & ~(DEPTH_BLOCK - 1);
+		const uint32_t zBase = st[ST_Z_BASE];
+		const uint32_t zStart = (zBase + (x1 + y1 * zStride) * 2) & ~(DEPTH_BLOCK - 1);
+		const uint32_t zEnd = (zBase + (x2 + y2 * zStride) * 2 + 2 + DEPTH_BLOCK - 1) & ~(DEPTH_BLOCK - 1);
 		VerifyVRAM(zStart, zEnd - zStart);
 		if (id.depthWrite)
 			MarkGPUWrite(zStart, zEnd - zStart);

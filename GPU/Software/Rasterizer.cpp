@@ -2960,7 +2960,7 @@ static void PushUVPlanes(SoftCompute::PrimWords &prims, const UVPlanes &uv) {
 	SoftCompute::PushPlane(prims, uv.t.base, uv.t.kx, uv.t.ky);
 }
 
-bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims, bool *drawOnCPU) {
+bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
 	using namespace SoftCompute;
 	const PixelFuncID &pixelID = state.pixelID;
 	const bool clearMode = pixelID.clearMode;
@@ -2990,8 +2990,7 @@ bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &
 
 	const UVPlanes uvPlanes = state.enableTextures ? ComputeUVPlanes(v0, v1, v2, state.textureProj && !state.throughMode) : UVPlanes{};
 	if (state.enableTextures && !uvPlanes.valid) {
-		// The edge weight interpolation DrawTriangleSlice falls back to (a w that isn't positive and finite).
-		*drawOnCPU = true;
+		// Drawn on the CPU instead (TriangleNeedsCPU).
 		return false;
 	}
 
@@ -3329,6 +3328,19 @@ bool PackLine(const VertexData &v0, const VertexData &v1, const BinCoords &range
 	prims[start + PRIM_XY2] = (uint32_t)(x2 & 0xFFFF) | ((uint32_t)y2 << 16);
 	prims[start + PRIM_HEADER_WORDS + FRAG_COUNT] = count;
 	return true;
+}
+
+// Without UV planes (a w that isn't positive and finite), DrawTriangleSlice interpolates UVs from the edge
+// weights, in float.
+bool TriangleNeedsCPU(const VertexData &v0, const VertexData &v1, const VertexData &v2, const RasterizerState &state) {
+	if (!state.enableTextures)
+		return false;
+	for (const VertexData *v : { &v0, &v1, &v2 }) {
+		const float w24 = TruncateToFloat24(v->clipw);
+		if (!(w24 > 0.0f) || !std::isfinite(w24))
+			return true;
+	}
+	return false;
 }
 
 bool PackPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {

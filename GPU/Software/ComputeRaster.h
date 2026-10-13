@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 class StringWriter;
@@ -240,8 +241,19 @@ public:
 			words_[i] = 0;
 		size_ = n;
 	}
+	void append(const uint32_t *words, size_t count) {
+		if (size_ + count > words_.size())
+			words_.resize(std::max(size_ + count, words_.size() * 2));
+		memcpy(&words_[size_], words, count * sizeof(uint32_t));
+		size_ += count;
+	}
 	void clear() {
 		size_ = 0;
+	}
+	// Grows the storage up front, so filling it doesn't (growing it zeroes and faults in the new memory).
+	void reserve(size_t n) {
+		if (n > words_.size())
+			words_.resize(n);
 	}
 	size_t size() const {
 		return size_;
@@ -278,6 +290,8 @@ public:
 	virtual uint32_t BatchId() const = 0;
 	// Where the Pack* functions append primitives.
 	virtual PrimWords &Prims() = 0;
+	// The next PackState draws the batch so far and starts a new one.
+	virtual bool BatchFull() const = 0;
 	// After a primitive using the state was appended at offset.
 	virtual void CommitPrim(uint32_t offset, const Rasterizer::RasterizerState &state) = 0;
 	// Ends a segment, the primitives drawn together. Within one each pixel sees its primitives in order, but
@@ -325,12 +339,14 @@ namespace Rasterizer {
 // The setup of a binned primitive for the compute rasterizer, appended to prims (the state's index in the
 // batch is stateIndex). False when it draws nothing, and then nothing was appended. These share their setup
 // with DrawTriangle and the rest, so they draw exactly the same pixels.
-// Sets drawOnCPU, returning false, for a triangle the shader can't draw (DrawTriangle has to).
-bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims, bool *drawOnCPU);
+// They're safe to call from several threads at once.
+bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
 bool PackRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
 bool PackSprite(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
 bool PackClearRect(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
 bool PackLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
 bool PackPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
+// A triangle the shader can't draw, which DrawTriangle has to (PackTriangle draws nothing of it).
+bool TriangleNeedsCPU(const VertexData &v0, const VertexData &v1, const VertexData &v2, const RasterizerState &state);
 
 }  // namespace Rasterizer

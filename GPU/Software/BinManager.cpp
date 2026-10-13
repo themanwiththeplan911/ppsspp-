@@ -841,6 +841,8 @@ static bool FlushNeedsMemory(const char *reason) {
 }
 
 void BinManager::Flush(const char *reason) {
+	if (compute_)
+		DrainCompute();
 	if (compute_ && !queuedSinceFlush_ && compute_->AnyGPUWrites() && FlushNeedsMemory(reason))
 		compute_->Flush(true);
 	if (!queuedSinceFlush_) {
@@ -1323,7 +1325,7 @@ bool BinManager::HasUnreadGPUWrites() const {
 }
 
 void BinManager::SetComputeBackend(SoftCompute::Backend *backend) {
-	_dbg_assert_(queue_.Empty());
+	_dbg_assert_(queue_.Empty() && computePending_.empty());
 	delete compute_;
 	compute_ = backend;
 	computeStates_.clear();
@@ -1338,6 +1340,9 @@ uint32_t BinManager::ComputeState(uint16_t index, bool snapshot) {
 	uint64_t &entry = computeStates_[(size_t)index * 2 + (snapshot ? 1 : 0)];
 	if ((entry >> 32) == batch)
 		return (uint32_t)entry;
+	// The pending items go in the batch their states are in.
+	if (compute_->BatchFull())
+		DrainCompute();
 	const uint32_t packed = compute_->PackState(states_[index], snapshot);
 	entry = ((uint64_t)compute_->BatchId() << 32) | packed;
 	return packed;
@@ -1375,50 +1380,30 @@ void BinManager::ComputeSelfTextureSnapshot(const RasterizerState &state) {
 	}
 }
 
-// ItemQueued with the compute backend: the item goes to the GPU right away, in the segment of primitives drawn
-// together unless it needs order (NeedsOrder), and then it's drawn alone after everything before it.
+// ItemQueued with the compute backend: the item goes to the GPU in the segment of primitives drawn together,
+// unless it needs order (NeedsOrder), and then it's drawn alone after everything before it.
 void BinManager::ItemQueuedCompute() {
 	const size_t last = (queue_.tail_ + QUEUED_PRIMS - 1) % QUEUED_PRIMS;
 	const BinItem &item = queue_[last];
 	const RasterizerState &state = states_[item.stateIndex];
 	const bool order = NeedsOrder(item);
-	if (order)
+	if (order) {
+		DrainCompute();
 		compute_->EndSegment();
-	const bool snapshot = order && state.selfTexture;
-	if (snapshot)
-		ComputeSelfTextureSnapshot(state);
-	const uint32_t stateIndex = ComputeState(item.stateIndex, snapshot);
-
-	SoftCompute::PrimWords &prims = compute_->Prims();
-	const uint32_t offset = (uint32_t)prims.size();
-	bool added = false;
-	bool drawOnCPU = false;
-	switch (item.type) {
-	case BinItemType::TRIANGLE:
-		added = PackTriangle(item.v0, item.v1, item.v2, item.range, state, stateIndex, prims, &drawOnCPU);
-		break;
-	case BinItemType::CLEAR_RECT:
-		added = PackClearRect(item.v0, item.v1, item.range, state, stateIndex, prims);
-		break;
-	case BinItemType::RECT:
-		added = PackRectangle(item.v0, item.v1, item.range, state, stateIndex, prims);
-		break;
-	case BinItemType::SPRITE:
-		added = PackSprite(item.v0, item.v1, item.range, state, stateIndex, prims);
-		break;
-	case BinItemType::LINE:
-		added = PackLine(item.v0, item.v1, item.range, state, stateIndex, prims);
-		break;
-	case BinItemType::POINT:
-		added = PackPoint(item.v0, item.range, state, stateIndex, prims);
-		break;
 	}
-	if (added) {
-		compute_->CommitPrim(offset, state);
-	} else if (drawOnCPU) {
+	if (item.type == BinItemType::TRIANGLE && TriangleNeedsCPU(item.v0, item.v1, item.v2, state)) {
 		// Rare, so it's simplest to bring memory up to date and draw it here, in order.
+		DrainCompute();
 		compute_->Flush(true);
 		DrawTriangle(item.v0, item.v1, item.v2, item.range, state);
+	} else {
+		const bool snapshot = order && state.selfTexture;
+		if (snapshot)
+			ComputeSelfTextureSnapshot(state);
+		const uint32_t stateIndex = ComputeState(item.stateIndex, snapshot);
+		computePending_.push_back(ComputePending{ item, stateIndex });
+		if (order || computePending_.size() >= 2048)
+			DrainCompute();
 	}
 
 	if (order) {
@@ -1428,4 +1413,78 @@ void BinManager::ItemQueuedCompute() {
 	queue_.Reset();
 	distributePos_ = 0;
 	undistributed_ = 0;
+}
+
+static bool PackItem(const BinItem &item, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
+	switch (item.type) {
+	case BinItemType::TRIANGLE:
+		return PackTriangle(item.v0, item.v1, item.v2, item.range, state, stateIndex, prims);
+	case BinItemType::CLEAR_RECT:
+		return PackClearRect(item.v0, item.v1, item.range, state, stateIndex, prims);
+	case BinItemType::RECT:
+		return PackRectangle(item.v0, item.v1, item.range, state, stateIndex, prims);
+	case BinItemType::SPRITE:
+		return PackSprite(item.v0, item.v1, item.range, state, stateIndex, prims);
+	case BinItemType::LINE:
+		return PackLine(item.v0, item.v1, item.range, state, stateIndex, prims);
+	case BinItemType::POINT:
+		return PackPoint(item.v0, item.range, state, stateIndex, prims);
+	}
+	return false;
+}
+
+// Packs the pending items, split between threads, and hands them to the backend in order.
+void BinManager::DrainCompute() {
+	const int count = (int)computePending_.size();
+	if (count == 0)
+		return;
+	// Small chunks, taken in turn, so the threads finish together (the items vary a lot in cost).
+	constexpr int CHUNK_ITEMS = 64;
+	const int chunks = (count + CHUNK_ITEMS - 1) / CHUNK_ITEMS;
+	if ((int)computeChunks_.size() < chunks) {
+		computeChunks_.resize(chunks);
+		for (SoftCompute::PrimWords &words : computeChunks_)
+			words.reserve(16 * 1024);
+	}
+	computeEnds_.resize(count);
+
+	std::atomic<int> nextChunk{ 0 };
+	auto packChunks = [&]() {
+		int c;
+		while ((c = nextChunk.fetch_add(1)) < chunks) {
+			// Packed into a local: the chunks' sizes share cache lines.
+			SoftCompute::PrimWords out = std::move(computeChunks_[c]);
+			out.clear();
+			const int end = std::min(count, (c + 1) * CHUNK_ITEMS);
+			for (int i = c * CHUNK_ITEMS; i < end; ++i) {
+				const ComputePending &p = computePending_[i];
+				const bool added = PackItem(p.item, states_[p.item.stateIndex], p.stateIndex, out);
+				computeEnds_[i] = added ? (uint32_t)out.size() : ~0U;
+			}
+			computeChunks_[c] = std::move(out);
+		}
+	};
+	const int helpers = std::min(chunks - 1, g_threadManager.GetNumLooperThreads());
+	WaitableCounter *waitable = nullptr;
+	if (helpers > 0)
+		waitable = ParallelRangeLoopWaitable(&g_threadManager, [&](int, int) { packChunks(); }, 0, helpers, 1, helpers, TaskPriority::HIGH);
+	packChunks();
+	if (waitable)
+		waitable->WaitAndRelease();
+
+	SoftCompute::PrimWords &prims = compute_->Prims();
+	for (int c = 0; c < chunks; ++c) {
+		const SoftCompute::PrimWords &words = computeChunks_[c];
+		uint32_t start = 0;
+		const int end = std::min(count, (c + 1) * CHUNK_ITEMS);
+		for (int i = c * CHUNK_ITEMS; i < end; ++i) {
+			if (computeEnds_[i] == ~0U)
+				continue;
+			const uint32_t offset = (uint32_t)prims.size();
+			prims.append(words.data() + start, computeEnds_[i] - start);
+			start = computeEnds_[i];
+			compute_->CommitPrim(offset, states_[computePending_[i].item.stateIndex]);
+		}
+	}
+	computePending_.clear();
 }
