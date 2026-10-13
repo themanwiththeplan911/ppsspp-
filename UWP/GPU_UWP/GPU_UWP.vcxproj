@@ -139,6 +139,7 @@
     <ClInclude Include="..\..\GPU\GPUState.h" />
     <ClInclude Include="..\..\GPU\Math3D.h" />
     <ClInclude Include="..\..\GPU\Software\BinManager.h" />
+    <ClInclude Include="..\..\GPU\Software\ComputeRaster.h" />
     <ClInclude Include="..\..\GPU\Software\Clipper.h" />
     <ClInclude Include="..\..\GPU\Software\DrawPixel.h" />
     <ClInclude Include="..\..\GPU\Software\FuncId.h" />

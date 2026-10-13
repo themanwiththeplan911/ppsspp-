@@ -30,6 +30,7 @@
 #include "Core/System.h"
 #include "GPU/Common/TextureDecoder.h"
 #include "GPU/Software/BinManager.h"
+#include "GPU/Software/ComputeRaster.h"
 #include "GPU/Software/Rasterizer.h"
 #include "GPU/Software/RasterizerRectangle.h"
 #include "GPU/Software/SoftGpu.h"
@@ -176,6 +177,7 @@ BinManager::BinManager() {
 }
 
 BinManager::~BinManager() {
+	delete compute_;
 	delete waitable_;
 	FreeAlignedMemory(tiles_);
 
@@ -203,11 +205,16 @@ void BinManager::PushState() {
 			};
 			stateIndex_ = moved(stateIndex_);
 			pendingStateIndex_ = moved(pendingStateIndex_);
+			computeStates_.clear();
 			INFO_LOG(Log::G3D, "Software: state ring grown to %d", (int)states_.Capacity());
 		}
 	}
 	creatingState_ = true;
 	stateIndex_ = (uint16_t)states_.Push(RasterizerState());
+	if ((size_t)stateIndex_ * 2 + 1 < computeStates_.size()) {
+		computeStates_[stateIndex_ * 2] = ~0ULL;
+		computeStates_[stateIndex_ * 2 + 1] = ~0ULL;
+	}
 	// When new funcs are compiled, we need to flush if WX exclusive. Compiling can also clear the caches,
 	// losing the funcs picked before it, so then compute it again.
 	for (int tries = 0; tries < 3; ++tries) {
@@ -840,14 +847,18 @@ void BinManager::Flush(const char *reason) {
 	if (collectDebugStats) {
 		st = time_now_d();
 	}
-	Drain();
-	if (maxTasks_ > 1 || activeCount_ != 0) {
-		// Help with the drawing, then wait for what the threads are still on.
-		while (ProcessTiles(0)) {
+	if (compute_) {
+		compute_->Flush();
+	} else {
+		Drain();
+		if (maxTasks_ > 1 || activeCount_ != 0) {
+			// Help with the drawing, then wait for what the threads are still on.
+			while (ProcessTiles(0)) {
+			}
 		}
+		waitable_->Wait();
+		ResetTiles();
 	}
-	waitable_->Wait();
-	ResetTiles();
 	distributePos_ = 0;
 	undistributed_ = 0;
 	// The CPU and transfers may write memory after a flush.
@@ -860,8 +871,11 @@ void BinManager::Flush(const char *reason) {
 	while (cluts_.Size() > 1)
 		cluts_.SkipNext();
 
-	Rasterizer::FlushJit();
-	Sampler::FlushJit();
+	// The compute backend draws without the JIT, so it doesn't compile what states asked for.
+	if (!compute_) {
+		Rasterizer::FlushJit();
+		Sampler::FlushJit();
+	}
 
 	queuedSinceFlush_ = false;
 
@@ -965,6 +979,8 @@ bool BinManager::HasPendingRead(uint32_t start, uint32_t stride, uint32_t w, uin
 }
 
 void BinManager::GetStats(StringWriter &w) {
+	if (compute_)
+		compute_->GetStats(w);
 	double allTotal = 0.0;
 	double slowestTotalTime = 0.0;
 	const char *slowestTotalReason = nullptr;
@@ -1051,6 +1067,10 @@ BinCoords BinManager::Range(const VertexData &v0) {
 // After queuing an item: draw it now, alone, or later in a batch.
 void BinManager::ItemQueued() {
 	queuedSinceFlush_ = true;
+	if (compute_) {
+		ItemQueuedCompute();
+		return;
+	}
 
 	if (maxTasks_ == 1) {
 		Drain();
@@ -1280,4 +1300,106 @@ void BinManager::DrainDependent() {
 	distributePos_ = 0;
 	undistributed_ = 0;
 	ClearTileMarks();
+}
+
+void BinManager::SetComputeBackend(SoftCompute::Backend *backend) {
+	_dbg_assert_(queue_.Empty());
+	delete compute_;
+	compute_ = backend;
+	computeStates_.clear();
+	selfTexCached_ = false;
+	memset(computeSnapBytes_, 0, sizeof(computeSnapBytes_));
+}
+
+uint32_t BinManager::ComputeState(uint16_t index, bool snapshot) {
+	if (computeStates_.size() < states_.Capacity() * 2)
+		computeStates_.assign(states_.Capacity() * 2, ~0ULL);
+	const uint64_t batch = compute_->BatchId();
+	uint64_t &entry = computeStates_[(size_t)index * 2 + (snapshot ? 1 : 0)];
+	if ((entry >> 32) == batch)
+		return (uint32_t)entry;
+	const uint32_t packed = compute_->PackState(states_[index], snapshot);
+	entry = (compute_->BatchId() << 32) | packed;
+	return packed;
+}
+
+// SelfTextureSnapshot's choice, with the copies on the GPU: a texture small enough for the GE's texture cache
+// stays as it was first read until TEXFLUSH, anything else is copied again for each primitive.
+void BinManager::ComputeSelfTextureSnapshot(const RasterizerState &state) {
+	const uint32_t bits = textureBitsPerPixel[state.samplerID.texfmt];
+	uint32_t totalBytes = 0;
+	bool sameTexture = true;
+	for (int i = 0; i <= state.maxTexLevel; ++i) {
+		const uint32_t bytes = state.samplerID.cached.sizes[i].w * bits / 8 * state.samplerID.cached.sizes[i].h;
+		totalBytes += bytes;
+		sameTexture = sameTexture && selfTexAddr_[i] == state.texaddr[i] && computeSnapBytes_[i] == state.texbufw[i] * bits / 8 * state.samplerID.cached.sizes[i].h;
+	}
+	const bool cacheSized = totalBytes <= 8192;
+	if (cacheSized && selfTexCached_ && sameTexture && selfTexFlushGen_ == state.texFlushGen)
+		return;
+	selfTexCached_ = cacheSized;
+	selfTexFlushGen_ = state.texFlushGen;
+
+	compute_->BeginSnapshot();
+	for (int i = 0; i <= state.maxTexLevel; ++i) {
+		const uint32_t bytes = state.texbufw[i] * bits / 8 * state.samplerID.cached.sizes[i].h;
+		if (!state.texptr[i] || !Memory::IsValidRange(state.texaddr[i], bytes))
+			continue;
+		// A depth mirror reads a linear copy made with the state (DeswizzleMirrorTextures), which a snapshot
+		// of would be the same.
+		if (Memory::IsDepthTexVRAMAddress(state.texaddr[i]))
+			continue;
+		compute_->SnapshotLevel(i, state.texaddr[i], bytes);
+		selfTexAddr_[i] = state.texaddr[i];
+		computeSnapBytes_[i] = bytes;
+	}
+}
+
+// ItemQueued with the compute backend: the item goes to the GPU right away, in the segment of primitives drawn
+// together unless it needs order (NeedsOrder), and then it's drawn alone after everything before it.
+void BinManager::ItemQueuedCompute() {
+	const size_t last = (queue_.tail_ + QUEUED_PRIMS - 1) % QUEUED_PRIMS;
+	const BinItem &item = queue_[last];
+	const RasterizerState &state = states_[item.stateIndex];
+	const bool order = NeedsOrder(item);
+	if (order)
+		compute_->EndSegment();
+	const bool snapshot = order && state.selfTexture;
+	if (snapshot)
+		ComputeSelfTextureSnapshot(state);
+	const uint32_t stateIndex = ComputeState(item.stateIndex, snapshot);
+
+	std::vector<uint32_t> &prims = compute_->Prims();
+	const uint32_t offset = (uint32_t)prims.size();
+	bool added = false;
+	switch (item.type) {
+	case BinItemType::TRIANGLE:
+		added = PackTriangle(item.v0, item.v1, item.v2, item.range, state, stateIndex, prims);
+		break;
+	case BinItemType::CLEAR_RECT:
+		added = PackClearRect(item.v0, item.v1, item.range, state, stateIndex, prims);
+		break;
+	case BinItemType::RECT:
+		added = PackRectangle(item.v0, item.v1, item.range, state, stateIndex, prims);
+		break;
+	case BinItemType::SPRITE:
+		added = PackSprite(item.v0, item.v1, item.range, state, stateIndex, prims);
+		break;
+	case BinItemType::LINE:
+		added = PackLine(item.v0, item.v1, item.range, state, stateIndex, prims);
+		break;
+	case BinItemType::POINT:
+		added = PackPoint(item.v0, item.range, state, stateIndex, prims);
+		break;
+	}
+	if (added)
+		compute_->CommitPrim(offset, state);
+
+	if (order) {
+		compute_->EndSegment();
+		ClearTileMarks();
+	}
+	queue_.Reset();
+	distributePos_ = 0;
+	undistributed_ = 0;
 }

@@ -36,6 +36,9 @@ typedef Vec3<float> ViewCoords;
 typedef Vec4<float> ClipCoords; // Range: -w <= x/y/z <= w
 
 class BinManager;
+namespace SoftCompute {
+class Backend;
+}
 struct TransformState;
 
 enum class CullType {
@@ -144,6 +147,10 @@ public:
 	void NotifyTexFlush();
 
 	void GetStats(StringWriter &w);
+
+	// Rasterizes with compute shaders (ComputeRaster.h), or with null on the CPU again. Takes ownership.
+	void SetComputeBackend(GPUCommon *common, SoftCompute::Backend *backend);
+	bool ComputeActive() const;
 
 	void SetDirty(SoftDirty flags);
 	SoftDirty GetDirty();

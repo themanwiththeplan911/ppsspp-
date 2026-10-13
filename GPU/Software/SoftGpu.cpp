@@ -39,6 +39,7 @@
 #include "Common/GPU/thin3d.h"
 
 #include "GPU/GPUCommon.h"
+#include "GPU/Software/ComputeRaster.h"
 #include "GPU/Software/DrawPixel.h"
 #include "GPU/Software/Rasterizer.h"
 #include "GPU/Software/Sampler.h"
@@ -455,9 +456,34 @@ SoftGPU::SoftGPU(GraphicsContext *gfxCtx, Draw::DrawContext *draw)
 	NotifyConfigChanged();
 	NotifyDisplayResized();
 	// NotifyRenderResized();  // hopefully not needed here.
+	UpdateComputeBackend();
+}
+
+// On Vulkan, rasterize with compute shaders unless the config says not to.
+void SoftGPU::UpdateComputeBackend() {
+	TransformUnit &transformUnit = drawEngine_->transformUnit;
+	const bool want = draw_ && GetGPUBackend() == GPUBackend::VULKAN && g_Config.bSoftwareRenderingCompute;
+	if (!want) {
+		computeFailed_ = false;
+		if (transformUnit.ComputeActive())
+			transformUnit.SetComputeBackend(this, nullptr);
+		return;
+	}
+#if !PPSSPP_PLATFORM(SWITCH) && !PPSSPP_PLATFORM(UWP)
+	if (!transformUnit.ComputeActive() && !computeFailed_) {
+		SoftCompute::Backend *backend = SoftCompute::CreateVulkanBackend(draw_);
+		if (backend)
+			transformUnit.SetComputeBackend(this, backend);
+		else
+			computeFailed_ = true;
+	}
+#endif
 }
 
 void SoftGPU::DeviceLost() {
+	// What's queued for the GPU is lost with it.
+	if (drawEngine_->transformUnit.ComputeActive())
+		drawEngine_->transformUnit.SetComputeBackend(this, nullptr);
 	if (presentation_)
 		presentation_->DeviceLost();
 	draw_ = nullptr;
@@ -472,6 +498,7 @@ void SoftGPU::DeviceRestore(Draw::DrawContext *draw) {
 	if (presentation_)
 		presentation_->DeviceRestore(draw_);
 	PPGeSetDrawContext(draw_);
+	UpdateComputeBackend();
 }
 
 SoftGPU::~SoftGPU() {
@@ -801,6 +828,7 @@ void SoftGPU::CheckConfigChanged(const DisplayLayoutConfig &config) {
 		if (presentation_) {
 			presentation_->UpdatePostShader(config);
 		}
+		UpdateComputeBackend();
 		configChanged_ = false;
 	}
 }

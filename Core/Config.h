@@ -302,6 +302,8 @@ public:
 
 	bool bSoftwareRendering;
 	bool bSoftwareRenderingJit;
+	// On Vulkan, the software renderer rasterizes with compute shaders unless this is off.
+	bool bSoftwareRenderingCompute;
 	bool bSoftwareDisableDithering;
 	bool bHardwareTransform;
 	bool bVendorBugChecksEnabled;

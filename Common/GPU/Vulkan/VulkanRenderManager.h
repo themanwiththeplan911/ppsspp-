@@ -509,6 +509,12 @@ public:
 	}
 
 	VkCommandBuffer GetInitCmd();
+	// Runs everything recorded so far, the init commands too, and waits for the GPU to finish it. Like a
+	// blocking readback, for work recorded in the init commands whose results the CPU needs.
+	void SyncInitCommands() {
+		EndCurRenderStep();
+		FlushSync();
+	}
 
 	bool CreateBackbuffers();
 	void DestroyBackbuffers();

@@ -1184,6 +1184,15 @@ void TransformUnit::Flush(GPUCommon *common, const char *reason) {
 	hasDraws_ = false;
 }
 
+void TransformUnit::SetComputeBackend(GPUCommon *common, SoftCompute::Backend *backend) {
+	Flush(common, "backend");
+	binner_->SetComputeBackend(backend);
+}
+
+bool TransformUnit::ComputeActive() const {
+	return binner_->ComputeActive();
+}
+
 void TransformUnit::GetStats(StringWriter &w) {
 	// TODO: More stats?
 	binner_->GetStats(w);

@@ -23,6 +23,9 @@
 
 struct BinWaitable;
 class DrawBinItemsTask;
+namespace SoftCompute {
+class Backend;
+}
 
 enum class BinItemType : uint8_t {
 	TRIANGLE,
@@ -237,6 +240,13 @@ public:
 	void GetStats(StringWriter &w);
 	void ResetStats();
 
+	// Draws with compute shaders instead of the threads (ComputeRaster.h). Takes ownership; null goes back to
+	// the threads. Call with nothing queued.
+	void SetComputeBackend(SoftCompute::Backend *backend);
+	bool ComputeActive() const {
+		return compute_ != nullptr;
+	}
+
 	void SetDirty(SoftDirty flags) {
 		dirty_ |= flags;
 	}
@@ -403,6 +413,17 @@ private:
 	void WakeTasks();
 	void WakeChained();
 	bool ProcessTiles(int start);
+
+	// The compute backend's way of drawing a queued item, instead of the threads.
+	void ItemQueuedCompute();
+	uint32_t ComputeState(uint16_t index, bool snapshot);
+	void ComputeSelfTextureSnapshot(const Rasterizer::RasterizerState &state);
+	SoftCompute::Backend *compute_ = nullptr;
+	// For each state in the ring (twice: without and with a texture snapshot), its index in the backend's
+	// batch, with the batch's id in the upper 32 bits.
+	std::vector<uint64_t> computeStates_;
+	// The texture snapshot the backend has for self-texturing, as SelfTextureSnapshot keeps it.
+	uint32_t computeSnapBytes_[8]{};
 
 	friend class DrawBinItemsTask;
 };
