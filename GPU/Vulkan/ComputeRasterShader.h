@@ -246,6 +246,74 @@ void UVFromPlanes(int64_t qv, int64_t sv, int64_t tv, int expQ, int expS, int ex
 	t = UVProductBits(ToFloat24(tv, expT), r);
 }
 
+// UVFromPlanes in 32 bits, as GEUVSpanCore does it: right whenever the values and results stay normal
+// floats, else it takes the exact path.
+void UVFromPlanes32(int qv, int sv, int tv, int expQ, int expS, int expT, out uint s, out uint t, out uint q) {
+	bool bad = false;
+	uint xb[3];
+	const int vals[3] = int[3](qv, sv, tv);
+	const int exps[3] = int[3](expQ, expS, expT);
+	for (int i = 0; i < 3; ++i) {
+		if (vals[i] == 0) {
+			xb[i] = 0u;
+			continue;
+		}
+		const uint fb = floatBitsToUint(float(vals[i]));
+		const int field = int((fb >> 23) & 0xFFu) + exps[i];
+		bad = bad || field < 1 || field > 254;
+		xb[i] = (fb + uint(exps[i] << 23)) & 0xFFFFFF00u;
+	}
+	q = xb[0];
+	if (int(q) <= 0) {
+		s = 0u;
+		t = 0u;
+		if (bad)
+			UVFromPlanes(int64_t(qv), int64_t(sv), int64_t(tv), expQ, expS, expT, s, t, q);
+		return;
+	}
+	// GERecip, normal for q below 2^126.
+	const int qe = int((q >> 23) & 0xFFu) - 127;
+	bad = bad || qe > 125;
+	const ivec2 seg = GE_RECIP[(q >> 16) & 0x7Fu];
+	const int recip = (64 * seg.x + 63 + seg.y * int((q >> 8) & 0xFFu)) >> 7;
+	const uint rb = floatBitsToUint(float(recip)) - uint((16 + qe) << 23);
+	const uint rA = ((rb >> 8) & 0x7FFFu) | 0x8000u;
+	const int re = int((rb >> 23) & 0xFFu);
+	// GEUVProduct: the 16-bit significands' product, cut to 24 bits.
+	uint out2[2];
+	for (int i = 0; i < 2; ++i) {
+		const uint x = xb[i + 1];
+		const int xe = int((x >> 23) & 0xFFu);
+		if (xe == 0) {
+			bad = bad || (x & 0x7FFFFFFFu) != 0u;
+			out2[i] = x;
+			continue;
+		}
+		const uint p = (((x >> 8) & 0x7FFFu) | 0x8000u) * rA;
+		const bool hi = (p & 0x80000000u) != 0u;
+		const uint m = hi ? ((p >> 8) & 0x00FFFFFFu) : (p >> 7);
+		const int adjust = xe + re + (hi ? 8 : 7) - (254 + 30);
+		const int field = 150 + adjust;
+		bad = bad || field < 1 || field > 254;
+		out2[i] = (floatBitsToUint(float(m)) + uint(adjust << 23)) | (x & 0x80000000u);
+	}
+	s = out2[0];
+	t = out2[1];
+	if (bad) {
+		UVFromPlanes(int64_t(qv), int64_t(sv), int64_t(tv), expQ, expS, expT, s, t, q);
+	}
+}
+
+uint ToFloat24Fast(int v, int e2) {
+	if (v == 0)
+		return 0u;
+	const uint fb = floatBitsToUint(float(v));
+	const int field = int((fb >> 23) & 0xFFu) + e2;
+	if (field < 1 || field > 254)
+		return ToFloat24(int64_t(v), e2);
+	return (fb + uint(e2 << 23)) & 0xFFFFFF00u;
+}
+
 // Planes and edges, { base, kx, ky } in 64 bits. Summed in 32 bits when the primitive's flag says the sums fit.
 
 int64_t Load64(uint o) {
@@ -338,7 +406,8 @@ uint DXTTexelColor(uint block, uint x, uint y, int alpha) {
 		return 0u;
 	return MakeCol((red1 + red2) / 2, (green1 + green2) / 2, (blue1 + blue2) / 2, alpha);
 }
-
+)",
+R"(
 uint DXT5Lerp(uint alpha1, uint alpha2, uint n, uint steps) {
 	const uint a1 = (alpha1 * ((steps - n) << 8)) / steps;
 	const uint a2 = (alpha2 * (n << 8)) / steps;
@@ -387,8 +456,7 @@ uint ReadTexel(uint st, int level, uint u, uint v) {
 	const uint fmt = (samplerBits >> SM_TEXFMT_SHIFT) & 0xFu;
 	if (fmt >= TFMT_DXT1)
 		return DXTTexel(fmt, base, flags, bufw, u, v);
-)",
-R"(
+
 	const uint bits = TexBits(fmt);
 	uint offset;
 	if ((samplerBits & SM_SWIZZLE) == 0u) {
@@ -688,7 +756,8 @@ uint StencilOp(uint fmt, uint replace, uint op, uint old) {
 	default: return old;
 	}
 }
-
+)",
+R"(
 uint LogicOp(uint op, uint oldColor, uint newColor) {
 	switch (op) {
 	case 0u: return newColor & 0xFF000000u;
@@ -731,8 +800,7 @@ ivec3 BlendFactor(uint factor, ivec4 src, ivec4 dst, ivec3 other, uint fix) {
 ivec3 BlendTerm(ivec3 c, ivec3 f) {
 	return ((c * 2 + ivec3(1)) * (f * 2 + ivec3(1))) >> 10;
 }
-)",
-R"(
+
 // 255 - 2a goes negative, and then the term subtracts.
 ivec3 SignedBlendTerm(ivec3 c, ivec3 f) {
 	const ivec3 t = ((2 * c + ivec3(1)) * (2 * abs(f) + ivec3(1))) >> 10;
@@ -953,7 +1021,10 @@ bool TriangleFragment(uint prim, uint st, int x, int y, out Frag f) {
 	if (f.textured) {
 		const int expS = int(data[d + TRI_EXP_S]), expT = int(data[d + TRI_EXP_T]), expQ = int(data[d + TRI_EXP_Q]);
 		uint q;
-		UVFromPlanes(PlaneValue64(plane, p32, xc, yc), PlaneValue64(plane + 6u, p32, xc, yc), PlaneValue64(plane + 12u, p32, xc, yc), expQ, expS, expT, f.s, f.t, q);
+		if (p32)
+			UVFromPlanes32(PlaneValue(plane, true, xc, yc), PlaneValue(plane + 6u, true, xc, yc), PlaneValue(plane + 12u, true, xc, yc), expQ, expS, expT, f.s, f.t, q);
+		else
+			UVFromPlanes(PlaneValue64(plane, false, xc, yc), PlaneValue64(plane + 6u, false, xc, yc), PlaneValue64(plane + 12u, false, xc, yc), expQ, expS, expT, f.s, f.t, q);
 		if ((flags & PRIMF_LODQ) != 0u) {
 			// The q the mip level comes from: one per span of four pixels, at the span's second pixel in the
 			// direction the row is walked, or else its first pixel inside (Rasterizer's LodQFromPlanes).
@@ -969,7 +1040,7 @@ bool TriangleFragment(uint prim, uint st, int x, int y, out Frag f) {
 					}
 				}
 			}
-			q = ToFloat24(PlaneValue64(plane, p32, pick * 16 + 8, yc), expQ);
+			q = p32 ? ToFloat24Fast(PlaneValue(plane, true, pick * 16 + 8, yc), expQ) : ToFloat24(PlaneValue64(plane, false, pick * 16 + 8, yc), expQ);
 		}
 		if ((flags & PRIMF_THROUGH_UV) != 0u) {
 			const uint shifts = data[st + ST_TEXLEVEL];
@@ -1001,7 +1072,10 @@ bool RectFragment(uint prim, uint st, int x, int y, out Frag f) {
 		const int xc = x * 16 + 8, yc = y * 16 + 8;
 		const uint plane = d + RECT_PLANES;
 		uint q;
-		UVFromPlanes(PlaneValue64(plane, p32, xc, yc), PlaneValue64(plane + 6u, p32, xc, yc), PlaneValue64(plane + 12u, p32, xc, yc), int(data[d + RECT_EXP_Q]), int(data[d + RECT_EXP_S]), int(data[d + RECT_EXP_T]), f.s, f.t, q);
+		if (p32)
+			UVFromPlanes32(PlaneValue(plane, true, xc, yc), PlaneValue(plane + 6u, true, xc, yc), PlaneValue(plane + 12u, true, xc, yc), int(data[d + RECT_EXP_Q]), int(data[d + RECT_EXP_S]), int(data[d + RECT_EXP_T]), f.s, f.t, q);
+		else
+			UVFromPlanes(PlaneValue64(plane, false, xc, yc), PlaneValue64(plane + 6u, false, xc, yc), PlaneValue64(plane + 12u, false, xc, yc), int(data[d + RECT_EXP_Q]), int(data[d + RECT_EXP_S]), int(data[d + RECT_EXP_T]), f.s, f.t, q);
 		int detail = int(data[d + RECT_LOD_BASE]);
 		if ((flags & PRIMF_LOD_USES_Q) != 0u)
 			detail -= GELog16(q);
@@ -1009,7 +1083,8 @@ bool RectFragment(uint prim, uint st, int x, int y, out Frag f) {
 	}
 	return true;
 }
-
+)",
+R"(
 bool SpriteFragment(uint prim, uint st, int x, int y, out Frag f) {
 	const uint flags = data[prim + PRIM_TYPE_FLAGS];
 	const uint d = prim + PRIM_HEADER_WORDS;
@@ -1070,8 +1145,7 @@ void DrawClearRect(uint prim, uint st, int x, int y) {
 	const uint fmt = (px0 >> PX0_FBFORMAT_SHIFT) & 3u;
 	if ((px0 & PX0_DEPTHWRITE) != 0u)
 		MemWrite16(DepthAddr(st, x, y), data[d + CLEAR_Z]);
-)",
-R"(
+
 	// ClearRectangle's mask of what to keep.
 	const bool colorClear = (px0 & PX0_COLORTEST) != 0u;
 	const bool stencilClear = (px0 & PX0_STENCILTEST) != 0u;

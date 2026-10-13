@@ -829,7 +829,20 @@ bool BinManager::ProcessTiles(int start) {
 	return any;
 }
 
+// Flushes for these change what the next draws use, but nothing outside drawing looks at memory, so the compute
+// backend can leave what it drew on the GPU until a flush where something does.
+static bool FlushNeedsMemory(const char *reason) {
+	static const char *const internal[] = { "framebuf", "depthbuf", "translation", "states", "cluts", "compile", "selfdepth" };
+	for (const char *r : internal) {
+		if (!strcmp(reason, r))
+			return false;
+	}
+	return true;
+}
+
 void BinManager::Flush(const char *reason) {
+	if (compute_ && !queuedSinceFlush_ && compute_->AnyGPUWrites() && FlushNeedsMemory(reason))
+		compute_->Flush(true);
 	if (!queuedSinceFlush_) {
 		// Nothing queued, so nothing refers to the older states and CLUTs. Trim them anyway: callers
 		// flush because one of these rings is full, and push into it right after.
@@ -848,7 +861,7 @@ void BinManager::Flush(const char *reason) {
 		st = time_now_d();
 	}
 	if (compute_) {
-		compute_->Flush();
+		compute_->Flush(FlushNeedsMemory(reason));
 	} else {
 		Drain();
 		if (maxTasks_ > 1 || activeCount_ != 0) {
@@ -923,6 +936,9 @@ bool BinManager::HasPendingWrite(uint32_t start, uint32_t stride, uint32_t w, ui
 		return false;
 	// Ignore mirrors for overlap detection.
 	start &= 0x041FFFFF;
+	// What the compute backend drew and hasn't copied back yet.
+	if (compute_ && compute_->HasGPUWrites(start, stride * (h - 1) + w))
+		return true;
 
 	for (const auto &range : pendingWrites_) {
 		if (PendingWriteIn(range, start, stride, w, h))
@@ -1302,6 +1318,10 @@ void BinManager::DrainDependent() {
 	ClearTileMarks();
 }
 
+bool BinManager::HasUnreadGPUWrites() const {
+	return compute_ && compute_->AnyGPUWrites();
+}
+
 void BinManager::SetComputeBackend(SoftCompute::Backend *backend) {
 	_dbg_assert_(queue_.Empty());
 	delete compute_;
@@ -1319,7 +1339,7 @@ uint32_t BinManager::ComputeState(uint16_t index, bool snapshot) {
 	if ((entry >> 32) == batch)
 		return (uint32_t)entry;
 	const uint32_t packed = compute_->PackState(states_[index], snapshot);
-	entry = (compute_->BatchId() << 32) | packed;
+	entry = ((uint64_t)compute_->BatchId() << 32) | packed;
 	return packed;
 }
 

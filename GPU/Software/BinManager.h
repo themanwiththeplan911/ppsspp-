@@ -246,6 +246,8 @@ public:
 	bool ComputeActive() const {
 		return compute_ != nullptr;
 	}
+	// The compute backend drew to memory that hasn't been copied back yet, and a flush will.
+	bool HasUnreadGPUWrites() const;
 
 	void SetDirty(SoftDirty flags) {
 		dirty_ |= flags;

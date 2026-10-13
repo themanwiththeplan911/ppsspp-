@@ -247,8 +247,12 @@ public:
 	// snapshot is the levels copied since BeginSnapshot(); the rest read memory.
 	virtual void BeginSnapshot() = 0;
 	virtual void SnapshotLevel(int level, uint32_t addr, uint32_t bytes) = 0;
-	// Draws everything queued and copies what it drew back to PSP memory.
-	virtual void Flush() = 0;
+	// Draws everything queued. With readback, copies what it drew back to PSP memory (waiting for it);
+	// otherwise that waits for a later flush with it.
+	virtual void Flush(bool readback) = 0;
+	// Whether it drew to any of these bytes of VRAM without copying them back yet.
+	virtual bool HasGPUWrites(uint32_t addr, uint32_t bytes) const = 0;
+	virtual bool AnyGPUWrites() const = 0;
 	virtual void GetStats(StringWriter &w) {}
 };
 

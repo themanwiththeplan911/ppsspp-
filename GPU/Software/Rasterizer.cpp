@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstring>
 
 #include "Common/Common.h"
 #include "Common/CPUDetect.h"
@@ -1010,22 +1011,34 @@ struct DepthPlane {
 	}
 };
 
-static DepthPlane ComputePlane(const int64_t X[3], const int64_t Y[3], const int64_t Z[3]) {
-	DepthPlane plane{};
-	const int64_t det = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
-	if (det == 0) {
-		plane.base = Z[0] << 14;
-		return plane;
-	}
-	const int64_t nx = (Z[1] - Z[0]) * (Y[2] - Y[0]) - (Z[2] - Z[0]) * (Y[1] - Y[0]);
-	const int64_t ny = (Z[2] - Z[0]) * (X[1] - X[0]) - (Z[1] - Z[0]) * (X[2] - X[0]);
-	const uint64_t absDet = (uint64_t)(det < 0 ? -det : det);
+// The part of a plane that depends only on the positions. Every plane of a triangle (depth, color,
+// fog, UV) shares it, so the last one is kept per thread.
+struct PlaneSetup {
+	int64_t X[3], Y[3];
+	int64_t q;
 	int e;
-	const int64_t q = GESetupRecip(absDet, &e);
-	const int64_t sign = det < 0 ? -1 : 1;
-	// n / det * 2^14, as floor(n * q / 2^(e + 2)).
-	plane.kx = (sign * nx * q) >> (e + 2);
-	plane.ky = (sign * ny * q) >> (e + 2);
+	int64_t sign;
+	int anchor;
+	bool degenerate;
+	bool rightAnchored;
+};
+
+static const PlaneSetup &GetPlaneSetup(const int64_t X[3], const int64_t Y[3]) {
+	static thread_local PlaneSetup last{ { 0, 0, 0 }, { 0, 0, 0 }, 0, 0, 0, 0, true, false };
+	if (memcmp(last.X, X, sizeof(last.X)) == 0 && memcmp(last.Y, Y, sizeof(last.Y)) == 0)
+		return last;
+	PlaneSetup &s = last;
+	memcpy(s.X, X, sizeof(s.X));
+	memcpy(s.Y, Y, sizeof(s.Y));
+	const int64_t det = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+	s.degenerate = det == 0;
+	s.rightAnchored = false;
+	s.anchor = 0;
+	if (s.degenerate)
+		return s;
+	const uint64_t absDet = (uint64_t)(det < 0 ? -det : det);
+	s.q = GESetupRecip(absDet, &s.e);
+	s.sign = det < 0 ? -1 : 1;
 
 	int top = 0, mid = 1, bot = 2;
 	auto above = [&](int a, int b) { return Y[a] < Y[b] || (Y[a] == Y[b] && X[a] < X[b]); };
@@ -1036,7 +1049,7 @@ static DepthPlane ComputePlane(const int64_t X[3], const int64_t Y[3], const int
 	const bool flat = Y[top] == Y[mid] || Y[mid] == Y[bot];
 	int anchor = 0;
 	if (cross > 0 && !flat) {
-		plane.rightAnchored = true;
+		s.rightAnchored = true;
 		for (int i = 1; i < 3; ++i)
 			if (X[i] > X[anchor] || (X[i] == X[anchor] && Y[i] < Y[anchor]))
 				anchor = i;
@@ -1045,6 +1058,24 @@ static DepthPlane ComputePlane(const int64_t X[3], const int64_t Y[3], const int
 			if (X[i] < X[anchor] || (X[i] == X[anchor] && Y[i] < Y[anchor]))
 				anchor = i;
 	}
+	s.anchor = anchor;
+	return s;
+}
+
+static DepthPlane ComputePlane(const int64_t X[3], const int64_t Y[3], const int64_t Z[3]) {
+	DepthPlane plane{};
+	const PlaneSetup &s = GetPlaneSetup(X, Y);
+	if (s.degenerate) {
+		plane.base = Z[0] << 14;
+		return plane;
+	}
+	const int64_t nx = (Z[1] - Z[0]) * (Y[2] - Y[0]) - (Z[2] - Z[0]) * (Y[1] - Y[0]);
+	const int64_t ny = (Z[2] - Z[0]) * (X[1] - X[0]) - (Z[1] - Z[0]) * (X[2] - X[0]);
+	// n / det * 2^14, as floor(n * q / 2^(e + 2)).
+	plane.kx = (s.sign * nx * s.q) >> (s.e + 2);
+	plane.ky = (s.sign * ny * s.q) >> (s.e + 2);
+	plane.rightAnchored = s.rightAnchored;
+	const int anchor = s.anchor;
 	plane.base = (Z[anchor] << 14) - plane.kx * X[anchor] - plane.ky * Y[anchor];
 	return plane;
 }

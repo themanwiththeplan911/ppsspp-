@@ -1176,7 +1176,7 @@ void TransformUnit::SendTriangle(CullType cullType, const ClipVertexData *verts,
 }
 
 void TransformUnit::Flush(GPUCommon *common, const char *reason) {
-	if (!hasDraws_)
+	if (!hasDraws_ && !binner_->HasUnreadGPUWrites())
 		return;
 
 	binner_->Flush(reason);
@@ -1199,7 +1199,7 @@ void TransformUnit::GetStats(StringWriter &w) {
 }
 
 void TransformUnit::FlushIfOverlap(GPUCommon *common, const char *reason, bool modifying, uint32_t addr, uint32_t stride, uint32_t w, uint32_t h) {
-	if (!hasDraws_)
+	if (!hasDraws_ && !binner_->HasUnreadGPUWrites())
 		return;
 
 	if (binner_->HasPendingWrite(addr, stride, w, h))

@@ -58,6 +58,8 @@ static constexpr int TILES_Y = 1024 >> TILE_SHIFT;
 // Draw what's queued once a batch gets this large, without waiting for a flush.
 static constexpr size_t MAX_BATCH_PRIM_WORDS = 4 * 1024 * 1024;
 static constexpr size_t MAX_BATCH_UPLOAD_BYTES = 32 * 1024 * 1024;
+// Timestamps, two per batch between readbacks.
+static constexpr uint32_t MAX_QUERIES = 256;
 
 struct PushParams {
 	uint32_t statesOffset;
@@ -130,7 +132,11 @@ public:
 	void EndSegment() override;
 	void BeginSnapshot() override;
 	void SnapshotLevel(int level, uint32_t addr, uint32_t bytes) override;
-	void Flush() override;
+	void Flush(bool readback) override;
+	bool HasGPUWrites(uint32_t addr, uint32_t bytes) const override;
+	bool AnyGPUWrites() const override {
+		return anyGPUDirty_;
+	}
 	void GetStats(StringWriter &w) override;
 
 private:
@@ -170,6 +176,8 @@ private:
 
 	void Submit();
 	void ResetBatch();
+	template <typename F>
+	void ForPrimTiles(uint32_t off, F f);
 	void VerifyPages(uint32_t memOffset, uint32_t bytes);
 	void VerifyVRAM(uint32_t vramOffset, uint32_t bytes);
 	void MarkGPUWrite(uint32_t vramOffset, uint32_t bytes);
@@ -210,6 +218,16 @@ private:
 	// VRAM pages the GPU may have drawn to since the last flush.
 	std::vector<uint32_t> gpuDirty_;
 	bool anyGPUDirty_ = false;
+	// The last ranges verified and marked as drawn to, which the next primitive likely repeats. Valid while gen
+	// matches verifyGen_, which a flush advances.
+	struct LastRange {
+		uint32_t start;
+		uint32_t end;
+		uint32_t gen;
+	};
+	LastRange lastVerified_{};
+	LastRange lastMarked_{};
+	uint32_t verifyGen_ = 1;
 
 	// The batch being built.
 	uint32_t batchId_ = 1;
@@ -232,6 +250,8 @@ private:
 	std::vector<uint32_t> tilePos_;
 	std::vector<uint16_t> tilesTouched_;
 	std::vector<uint32_t> tileData_;
+	// Pairs of a primitive's offset and a tile it's in, for one segment.
+	std::vector<uint64_t> tilePrims_;
 
 	// Stats since the last GetStats.
 	int statPrims_ = 0;
@@ -241,6 +261,11 @@ private:
 	size_t statUploadBytes_ = 0;
 	size_t statReadbackBytes_ = 0;
 	double statSyncTime_ = 0.0;
+	// GPU time of the batches, from timestamps around each (read at the next readback).
+	VkQueryPool queryPool_ = VK_NULL_HANDLE;
+	uint32_t queriesUsed_ = 0;
+	double statGPUTime_ = 0.0;
+	double timestampPeriod_ = 0.0;
 };
 
 ComputeRasterVulkan::ComputeRasterVulkan(Draw::DrawContext *draw) {
@@ -345,6 +370,15 @@ bool ComputeRasterVulkan::Init() {
 	if (!UpdateDescriptorSet())
 		return false;
 
+	if (vulkan_->GetPhysicalDeviceProperties().properties.limits.timestampComputeAndGraphics) {
+		VkQueryPoolCreateInfo qp{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+		qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
+		qp.queryCount = MAX_QUERIES;
+		if (vkCreateQueryPool(device, &qp, nullptr, &queryPool_) != VK_SUCCESS)
+			queryPool_ = VK_NULL_HANDLE;
+		timestampPeriod_ = vulkan_->GetPhysicalDeviceProperties().properties.limits.timestampPeriod * 1e-9;
+	}
+
 	shadow_.assign(ramOffset_ + ramSize_, 0);
 	verified_.assign(((ramOffset_ + ramSize_) >> PAGE_SHIFT) / 32 + 1, 0);
 	gpuDirty_.assign((MEM_VRAM_SIZE >> PAGE_SHIFT) / 32, 0);
@@ -379,6 +413,8 @@ ComputeRasterVulkan::~ComputeRasterVulkan() {
 		vulkan_->Delete().QueueDeleteDescriptorSetLayout(descSetLayout_);
 	if (descPool_ != VK_NULL_HANDLE)
 		vulkan_->Delete().QueueDeleteDescriptorPool(descPool_);
+	if (queryPool_ != VK_NULL_HANDLE)
+		vulkan_->Delete().QueueDeleteQueryPool(queryPool_);
 }
 
 // The set binds whole buffers, so it changes when one does. Sets already recorded are left alone (the GPU may
@@ -501,6 +537,10 @@ void ComputeRasterVulkan::VerifyPages(uint32_t memOffset, uint32_t bytes) {
 
 void ComputeRasterVulkan::VerifyVRAM(uint32_t vramOffset, uint32_t bytes) {
 	vramOffset &= MEM_VRAM_SIZE - 1;
+	// Consecutive primitives mostly draw to the same pages.
+	if (vramOffset >= lastVerified_.start && vramOffset + bytes <= lastVerified_.end && lastVerified_.gen == verifyGen_)
+		return;
+	lastVerified_ = { vramOffset, vramOffset + bytes, verifyGen_ };
 	bytes = std::min(bytes, MEM_VRAM_SIZE);
 	const uint32_t first = std::min(bytes, MEM_VRAM_SIZE - vramOffset);
 	VerifyPages(vramOffset, first);
@@ -512,6 +552,9 @@ void ComputeRasterVulkan::MarkGPUWrite(uint32_t vramOffset, uint32_t bytes) {
 		return;
 	bytes = std::min(bytes, MEM_VRAM_SIZE);
 	vramOffset &= MEM_VRAM_SIZE - 1;
+	if (vramOffset >= lastMarked_.start && vramOffset + bytes <= lastMarked_.end && lastMarked_.gen == verifyGen_)
+		return;
+	lastMarked_ = { vramOffset, vramOffset + bytes, verifyGen_ };
 	const uint32_t first = vramOffset >> PAGE_SHIFT;
 	const uint32_t count = ((vramOffset + bytes - 1) >> PAGE_SHIFT) - first + 1;
 	const uint32_t vramPages = MEM_VRAM_SIZE >> PAGE_SHIFT;
@@ -764,6 +807,52 @@ void ComputeRasterVulkan::ResetBatch() {
 	batchId_++;
 }
 
+// Calls f(tile) for the tiles a primitive can draw in: those its pixel bounds touch, and for a triangle only
+// where every edge (but the snapping one, whose pixels look a few to the side) has a pixel center inside.
+template <typename F>
+void ComputeRasterVulkan::ForPrimTiles(uint32_t off, F f) {
+	const uint32_t xy1 = prims_[off + PRIM_XY1], xy2 = prims_[off + PRIM_XY2];
+	const int tx1 = std::min((int)(xy1 & 0xFFFF) >> TILE_SHIFT, TILES_X - 1), ty1 = std::min((int)(xy1 >> 16) >> TILE_SHIFT, TILES_Y - 1);
+	const int tx2 = std::min((int)(xy2 & 0xFFFF) >> TILE_SHIFT, TILES_X - 1), ty2 = std::min((int)(xy2 >> 16) >> TILE_SHIFT, TILES_Y - 1);
+	const bool triangle = (prims_[off + PRIM_TYPE_FLAGS] & 0xF) == (uint32_t)PrimType::TRIANGLE;
+	if (!triangle || (tx1 == tx2 && ty1 == ty2)) {
+		for (int ty = ty1; ty <= ty2; ++ty) {
+			for (int tx = tx1; tx <= tx2; ++tx)
+				f(ty * TILES_X + tx);
+		}
+		return;
+	}
+
+	const uint32_t *setup = &prims_[off + PRIM_HEADER_WORDS];
+	const int snapEdge = (int8_t)(setup[TRI_SNAP] & 0xFF);
+	int64_t a[3], b[3], c[3];
+	int edges = 0;
+	for (int k = 0; k < 3; ++k) {
+		if (k == snapEdge)
+			continue;
+		const uint32_t *e = setup + TRI_EDGES + k * 4;
+		a[edges] = (int32_t)e[0];
+		b[edges] = (int32_t)e[1];
+		c[edges] = (int64_t)((uint64_t)e[2] | ((uint64_t)e[3] << 32));
+		edges++;
+	}
+	constexpr int TILE_SUB = SCREEN_SCALE_FACTOR << TILE_SHIFT;
+	for (int ty = ty1; ty <= ty2; ++ty) {
+		const int64_t yc0 = (int64_t)ty * TILE_SUB + SCREEN_SCALE_FACTOR / 2, yc1 = yc0 + TILE_SUB - SCREEN_SCALE_FACTOR;
+		for (int tx = tx1; tx <= tx2; ++tx) {
+			const int64_t xc0 = (int64_t)tx * TILE_SUB + SCREEN_SCALE_FACTOR / 2, xc1 = xc0 + TILE_SUB - SCREEN_SCALE_FACTOR;
+			bool inside = true;
+			for (int k = 0; k < edges && inside; ++k) {
+				// The edge function's largest value over the tile's pixel centers.
+				const int64_t best = c[k] + a[k] * (a[k] > 0 ? xc1 : xc0) + b[k] * (b[k] > 0 ? yc1 : yc0);
+				inside = best >= 0;
+			}
+			if (inside)
+				f(ty * TILES_X + tx);
+		}
+	}
+}
+
 // Records the batch for the GPU (it runs with the frame's init commands, or at the next sync).
 void ComputeRasterVulkan::Submit() {
 	EndSegment();
@@ -779,18 +868,14 @@ void ComputeRasterVulkan::Submit() {
 		if (op.type != Op::Type::SEGMENT)
 			continue;
 		tilesTouched_.clear();
+		tilePrims_.clear();
 		for (uint32_t i = op.first; i < op.end; ++i) {
 			const uint32_t off = primOffsets_[i];
-			const uint32_t xy1 = prims_[off + PRIM_XY1], xy2 = prims_[off + PRIM_XY2];
-			const int tx1 = std::min((int)(xy1 & 0xFFFF) >> TILE_SHIFT, TILES_X - 1), ty1 = std::min((int)(xy1 >> 16) >> TILE_SHIFT, TILES_Y - 1);
-			const int tx2 = std::min((int)(xy2 & 0xFFFF) >> TILE_SHIFT, TILES_X - 1), ty2 = std::min((int)(xy2 >> 16) >> TILE_SHIFT, TILES_Y - 1);
-			for (int ty = ty1; ty <= ty2; ++ty) {
-				for (int tx = tx1; tx <= tx2; ++tx) {
-					const int t = ty * TILES_X + tx;
-					if (tileCount_[t]++ == 0)
-						tilesTouched_.push_back((uint16_t)t);
-				}
-			}
+			ForPrimTiles(off, [&](int t) {
+				tilePrims_.push_back(((uint64_t)off << 16) | (uint32_t)t);
+				if (tileCount_[t]++ == 0)
+					tilesTouched_.push_back((uint16_t)t);
+			});
 		}
 		op.tileFirst = (uint32_t)(tileData_.size() / 3);
 		op.tileCount = (uint32_t)tilesTouched_.size();
@@ -801,20 +886,11 @@ void ComputeRasterVulkan::Submit() {
 			tileData_.push_back(tileCount_[t]);
 			tilePos_[t] = pos;
 			pos += tileCount_[t];
+			tileCount_[t] = 0;
 		}
 		items.resize(pos);
-		for (uint32_t i = op.first; i < op.end; ++i) {
-			const uint32_t off = primOffsets_[i];
-			const uint32_t xy1 = prims_[off + PRIM_XY1], xy2 = prims_[off + PRIM_XY2];
-			const int tx1 = std::min((int)(xy1 & 0xFFFF) >> TILE_SHIFT, TILES_X - 1), ty1 = std::min((int)(xy1 >> 16) >> TILE_SHIFT, TILES_Y - 1);
-			const int tx2 = std::min((int)(xy2 & 0xFFFF) >> TILE_SHIFT, TILES_X - 1), ty2 = std::min((int)(xy2 >> 16) >> TILE_SHIFT, TILES_Y - 1);
-			for (int ty = ty1; ty <= ty2; ++ty) {
-				for (int tx = tx1; tx <= tx2; ++tx)
-					items[tilePos_[ty * TILES_X + tx]++] = off;
-			}
-		}
-		for (uint16_t t : tilesTouched_)
-			tileCount_[t] = 0;
+		for (uint64_t tp : tilePrims_)
+			items[tilePos_[tp & 0xFFFF]++] = (uint32_t)(tp >> 16);
 		statSegments_++;
 	}
 
@@ -879,6 +955,11 @@ void ComputeRasterVulkan::Submit() {
 	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
 	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
+	const bool timed = queryPool_ != VK_NULL_HANDLE && queriesUsed_ + 2 <= MAX_QUERIES;
+	if (timed) {
+		vkCmdResetQueryPool(cmd, queryPool_, queriesUsed_, 2);
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, queriesUsed_);
+	}
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &descSet_, 0, nullptr);
 	for (const Op &op : ops_) {
@@ -901,15 +982,35 @@ void ComputeRasterVulkan::Submit() {
 		}
 	}
 
+	if (timed) {
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool_, queriesUsed_ + 1);
+		queriesUsed_ += 2;
+	}
 	statBatches_++;
 	ResetBatch();
 }
 
-void ComputeRasterVulkan::Flush() {
+bool ComputeRasterVulkan::HasGPUWrites(uint32_t addr, uint32_t bytes) const {
+	if (!anyGPUDirty_ || bytes == 0)
+		return false;
+	bytes = std::min(bytes, MEM_VRAM_SIZE);
+	const uint32_t offset = addr & (MEM_VRAM_SIZE - 1);
+	const uint32_t first = offset >> PAGE_SHIFT;
+	const uint32_t count = ((offset + bytes - 1) >> PAGE_SHIFT) - first + 1;
+	const uint32_t vramPages = MEM_VRAM_SIZE >> PAGE_SHIFT;
+	for (uint32_t i = 0; i < count; ++i) {
+		const uint32_t page = (first + i) % vramPages;
+		if (gpuDirty_[page >> 5] & (1U << (page & 31)))
+			return true;
+	}
+	return false;
+}
+
+void ComputeRasterVulkan::Flush(bool readback) {
 	Submit();
 	statFlushes_++;
 
-	if (anyGPUDirty_) {
+	if (readback && anyGPUDirty_) {
 		// Copy back the pages the GPU drew to.
 		VkCommandBuffer cmd = renderManager_->GetInitCmd();
 		VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
@@ -937,6 +1038,14 @@ void ComputeRasterVulkan::Flush() {
 		renderManager_->SyncInitCommands();
 		statSyncTime_ += time_now_d() - start;
 		vmaInvalidateAllocation(vulkan_->Allocator(), readback_.alloc, 0, VK_WHOLE_SIZE);
+		if (queriesUsed_ != 0) {
+			uint64_t stamps[MAX_QUERIES];
+			if (vkGetQueryPoolResults(vulkan_->GetDevice(), queryPool_, 0, queriesUsed_, sizeof(stamps), stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+				for (uint32_t i = 0; i < queriesUsed_; i += 2)
+					statGPUTime_ += (double)(stamps[i + 1] - stamps[i]) * timestampPeriod_;
+			}
+			queriesUsed_ = 0;
+		}
 
 		// Only what the GPU changed goes to memory: the CPU may have written elsewhere in these pages since, and
 		// then the shadow keeps the GPU's old bytes, so the next upload sends the CPU's.
@@ -971,11 +1080,12 @@ void ComputeRasterVulkan::Flush() {
 
 	// The CPU may change memory now, so check again what's read next.
 	std::fill(verified_.begin(), verified_.end(), 0);
+	verifyGen_++;
 }
 
 void ComputeRasterVulkan::GetStats(StringWriter &w) {
 	w.F("Compute: %d prims, %d batches, %d segments, %d flushes\n", statPrims_, statBatches_, statSegments_, statFlushes_);
-	w.F("Uploaded %d KB, read back %d KB, sync wait %0.2f ms\n", (int)(statUploadBytes_ / 1024), (int)(statReadbackBytes_ / 1024), statSyncTime_ * 1000.0);
+	w.F("Uploaded %d KB, read back %d KB, sync wait %0.2f ms, GPU %0.2f ms\n", (int)(statUploadBytes_ / 1024), (int)(statReadbackBytes_ / 1024), statSyncTime_ * 1000.0, statGPUTime_ * 1000.0);
 	statPrims_ = 0;
 	statBatches_ = 0;
 	statSegments_ = 0;
@@ -983,6 +1093,7 @@ void ComputeRasterVulkan::GetStats(StringWriter &w) {
 	statUploadBytes_ = 0;
 	statReadbackBytes_ = 0;
 	statSyncTime_ = 0.0;
+	statGPUTime_ = 0.0;
 }
 
 Backend *CreateVulkanBackend(void *drawContext) {
