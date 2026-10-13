@@ -285,7 +285,8 @@ namespace Rasterizer {
 // The setup of a binned primitive for the compute rasterizer, appended to prims (the state's index in the
 // batch is stateIndex). False when it draws nothing, and then nothing was appended. These share their setup
 // with DrawTriangle and the rest, so they draw exactly the same pixels.
-bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims);
+// Sets drawOnCPU, returning false, for a triangle the shader can't draw (DrawTriangle has to).
+bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims, bool *drawOnCPU);
 bool PackRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims);
 bool PackSprite(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims);
 bool PackClearRect(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims);

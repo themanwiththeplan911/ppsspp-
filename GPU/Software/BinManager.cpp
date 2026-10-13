@@ -1392,9 +1392,10 @@ void BinManager::ItemQueuedCompute() {
 	std::vector<uint32_t> &prims = compute_->Prims();
 	const uint32_t offset = (uint32_t)prims.size();
 	bool added = false;
+	bool drawOnCPU = false;
 	switch (item.type) {
 	case BinItemType::TRIANGLE:
-		added = PackTriangle(item.v0, item.v1, item.v2, item.range, state, stateIndex, prims);
+		added = PackTriangle(item.v0, item.v1, item.v2, item.range, state, stateIndex, prims, &drawOnCPU);
 		break;
 	case BinItemType::CLEAR_RECT:
 		added = PackClearRect(item.v0, item.v1, item.range, state, stateIndex, prims);
@@ -1412,8 +1413,13 @@ void BinManager::ItemQueuedCompute() {
 		added = PackPoint(item.v0, item.range, state, stateIndex, prims);
 		break;
 	}
-	if (added)
+	if (added) {
 		compute_->CommitPrim(offset, state);
+	} else if (drawOnCPU) {
+		// Rare, so it's simplest to bring memory up to date and draw it here, in order.
+		compute_->Flush(true);
+		DrawTriangle(item.v0, item.v1, item.v2, item.range, state);
+	}
 
 	if (order) {
 		compute_->EndSegment();
