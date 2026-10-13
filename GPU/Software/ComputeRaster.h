@@ -25,6 +25,7 @@
 // Layout of what's packed: everything is 32-bit words, and the shader (ComputeRasterVulkan.cpp) gets the
 // offsets below as #defines, so this is the one place they're declared.
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -224,6 +225,45 @@ enum LevelBits : uint32_t {
 	LV_VRAM = 1 << 1,
 };
 
+// A batch's primitive words. Packing pushes around a hundred words per triangle, so push_back has to inline.
+class PrimWords {
+public:
+	void push_back(uint32_t w) {
+		if (size_ == words_.size())
+			words_.resize(std::max<size_t>(4096, words_.size() * 2));
+		words_[size_++] = w;
+	}
+	void resize(size_t n) {
+		if (n > words_.size())
+			words_.resize(n);
+		for (size_t i = size_; i < n; ++i)
+			words_[i] = 0;
+		size_ = n;
+	}
+	void clear() {
+		size_ = 0;
+	}
+	size_t size() const {
+		return size_;
+	}
+	bool empty() const {
+		return size_ == 0;
+	}
+	const uint32_t *data() const {
+		return words_.data();
+	}
+	uint32_t &operator[](size_t i) {
+		return words_[i];
+	}
+	uint32_t operator[](size_t i) const {
+		return words_[i];
+	}
+
+private:
+	std::vector<uint32_t> words_;
+	size_t size_ = 0;
+};
+
 // Draws binned primitives on the GPU, into its copy of PSP memory. BinManager feeds it in drawing order:
 // a state, then primitives packed with the Pack* functions below. It keeps PSP memory and its copy in sync:
 // before drawing, it uploads what the CPU changed that drawing reads, and Flush() copies back what it drew.
@@ -237,7 +277,7 @@ public:
 	// Changes when the batch is drawn and a new one starts, which forgets the packed states.
 	virtual uint32_t BatchId() const = 0;
 	// Where the Pack* functions append primitives.
-	virtual std::vector<uint32_t> &Prims() = 0;
+	virtual PrimWords &Prims() = 0;
 	// After a primitive using the state was appended at offset.
 	virtual void CommitPrim(uint32_t offset, const Rasterizer::RasterizerState &state) = 0;
 	// Ends a segment, the primitives drawn together. Within one each pixel sees its primitives in order, but
@@ -260,7 +300,7 @@ public:
 Backend *CreateVulkanBackend(void *drawContext);
 
 // Appends a primitive to prims: the header words, then its setup. Returns its offset.
-inline uint32_t BeginPrim(std::vector<uint32_t> &prims, PrimType type, uint32_t flags, uint32_t state, int x1, int y1, int x2, int y2) {
+inline uint32_t BeginPrim(PrimWords &prims, PrimType type, uint32_t flags, uint32_t state, int x1, int y1, int x2, int y2) {
 	const uint32_t offset = (uint32_t)prims.size();
 	prims.push_back((uint32_t)type | flags);
 	prims.push_back(state);
@@ -269,7 +309,7 @@ inline uint32_t BeginPrim(std::vector<uint32_t> &prims, PrimType type, uint32_t 
 	return offset;
 }
 
-inline void PushPlane(std::vector<uint32_t> &out, int64_t base, int64_t kx, int64_t ky) {
+inline void PushPlane(PrimWords &out, int64_t base, int64_t kx, int64_t ky) {
 	out.push_back((uint32_t)(uint64_t)base);
 	out.push_back((uint32_t)((uint64_t)base >> 32));
 	out.push_back((uint32_t)(uint64_t)kx);
@@ -286,11 +326,11 @@ namespace Rasterizer {
 // batch is stateIndex). False when it draws nothing, and then nothing was appended. These share their setup
 // with DrawTriangle and the rest, so they draw exactly the same pixels.
 // Sets drawOnCPU, returning false, for a triangle the shader can't draw (DrawTriangle has to).
-bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims, bool *drawOnCPU);
-bool PackRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims);
-bool PackSprite(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims);
-bool PackClearRect(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims);
-bool PackLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims);
-bool PackPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims);
+bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims, bool *drawOnCPU);
+bool PackRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
+bool PackSprite(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
+bool PackClearRect(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
+bool PackLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
+bool PackPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims);
 
 }  // namespace Rasterizer

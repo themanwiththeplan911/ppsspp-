@@ -125,7 +125,7 @@ public:
 	uint32_t BatchId() const override {
 		return batchId_;
 	}
-	std::vector<uint32_t> &Prims() override {
+	PrimWords &Prims() override {
 		return prims_;
 	}
 	void CommitPrim(uint32_t offset, const Rasterizer::RasterizerState &state) override;
@@ -232,7 +232,7 @@ private:
 	// The batch being built.
 	uint32_t batchId_ = 1;
 	std::vector<uint32_t> states_;
-	std::vector<uint32_t> prims_;
+	PrimWords prims_;
 	std::vector<uint32_t> primOffsets_;
 	uint32_t segmentStart_ = 0;
 	std::vector<Op> ops_;
@@ -918,7 +918,9 @@ void ComputeRasterVulkan::Submit() {
 		p += v.size() * 4;
 	};
 	put(states_);
-	put(prims_);
+	if (!prims_.empty())
+		memcpy(p, prims_.data(), prims_.size() * 4);
+	p += prims_.size() * 4;
 	put(tileData_);
 	put(items);
 	if (!uploadData_.empty())

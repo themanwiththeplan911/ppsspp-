@@ -1389,7 +1389,7 @@ void BinManager::ItemQueuedCompute() {
 		ComputeSelfTextureSnapshot(state);
 	const uint32_t stateIndex = ComputeState(item.stateIndex, snapshot);
 
-	std::vector<uint32_t> &prims = compute_->Prims();
+	SoftCompute::PrimWords &prims = compute_->Prims();
 	const uint32_t offset = (uint32_t)prims.size();
 	bool added = false;
 	bool drawOnCPU = false;

@@ -1112,17 +1112,41 @@ struct UVPlanes {
 	bool valid;
 };
 
+// std::ilogb and std::ldexp, without the library calls for the normal doubles they mostly get.
+static inline int DoubleExponentBits(double v) {
+	uint64_t bits;
+	memcpy(&bits, &v, sizeof(bits));
+	return (int)((bits >> 52) & 0x7FF);
+}
+
+static inline int FastIlogb(double v) {
+	const int e = DoubleExponentBits(v);
+	return e == 0 || e == 0x7FF ? std::ilogb(v) : e - 1023;
+}
+
+static inline double FastLdexp(double v, int shift) {
+	const int e = DoubleExponentBits(v);
+	// Zero, or a normal result: then the product with the power of two is exact.
+	const bool exact = v == 0.0 || (e != 0 && e != 0x7FF && e + shift > 0 && e + shift < 0x7FF);
+	if (!exact || shift < -1022 || shift > 1023)
+		return std::ldexp(v, shift);
+	const uint64_t bits = (uint64_t)(shift + 1023) << 52;
+	double scale;
+	memcpy(&scale, &bits, sizeof(scale));
+	return v * scale;
+}
+
 static int SharedShift(const double v[3]) {
 	int e = INT_MIN;
 	for (int i = 0; i < 3; ++i) {
 		if (v[i] != 0.0)
-			e = std::max(e, std::ilogb(v[i]));
+			e = std::max(e, FastIlogb(v[i]));
 	}
 	return e == INT_MIN ? 0 : 14 - e;
 }
 
 static DepthPlane FixedPlane(const int64_t X[3], const int64_t Y[3], const double v[3], int shift) {
-	const int64_t V[3] = { (int64_t)std::ldexp(v[0], shift), (int64_t)std::ldexp(v[1], shift), (int64_t)std::ldexp(v[2], shift) };
+	const int64_t V[3] = { (int64_t)FastLdexp(v[0], shift), (int64_t)FastLdexp(v[1], shift), (int64_t)FastLdexp(v[2], shift) };
 	return ComputePlane(X, Y, V);
 }
 
@@ -1150,7 +1174,7 @@ static UVPlanes ComputeUVPlanesSTQ(const int64_t X[3], const int64_t Y[3], const
 	auto fixed = [&](const double v[3], DepthPlane *plane, double *scale, int *exp) {
 		const int shift = SharedShift(v);
 		*plane = FixedPlane(X, Y, v, shift);
-		*scale = std::ldexp(1.0, -shift);
+		*scale = FastLdexp(1.0, -shift);
 		*exp = -shift;
 	};
 	fixed(s, &planes.s, &planes.scaleS, &planes.expS);
@@ -2652,9 +2676,9 @@ static LineUV ComputeLineUV(const VertexData &v0, const VertexData &v1, bool tex
 	}
 	auto fixed = [](const double c[2], int64_t out[2], double *scale) {
 		const int shift = SharedShift2(c);
-		out[0] = (int64_t)std::ldexp(c[0], shift);
-		out[1] = (int64_t)std::ldexp(c[1], shift);
-		*scale = std::ldexp(1.0, -shift);
+		out[0] = (int64_t)FastLdexp(c[0], shift);
+		out[1] = (int64_t)FastLdexp(c[1], shift);
+		*scale = FastLdexp(1.0, -shift);
 	};
 	fixed(s, uv.s, &uv.scaleS);
 	fixed(t, uv.t, &uv.scaleT);
@@ -2930,13 +2954,13 @@ static int LodBase(const RasterizerState &state, float autoGrad, bool *usesQ) {
 	}
 }
 
-static void PushUVPlanes(std::vector<uint32_t> &prims, const UVPlanes &uv) {
+static void PushUVPlanes(SoftCompute::PrimWords &prims, const UVPlanes &uv) {
 	SoftCompute::PushPlane(prims, uv.q.base, uv.q.kx, uv.q.ky);
 	SoftCompute::PushPlane(prims, uv.s.base, uv.s.kx, uv.s.ky);
 	SoftCompute::PushPlane(prims, uv.t.base, uv.t.kx, uv.t.ky);
 }
 
-bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims, bool *drawOnCPU) {
+bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims, bool *drawOnCPU) {
 	using namespace SoftCompute;
 	const PixelFuncID &pixelID = state.pixelID;
 	const bool clearMode = pixelID.clearMode;
@@ -3104,7 +3128,7 @@ bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &
 	return true;
 }
 
-bool PackRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims) {
+bool PackRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
 	using namespace SoftCompute;
 	// As DrawRectangle.
 	int entireX1 = std::min(v0.screenpos.x, v1.screenpos.x);
@@ -3196,7 +3220,7 @@ bool PackRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &
 	return true;
 }
 
-bool PackClearRect(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims) {
+bool PackClearRect(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
 	using namespace SoftCompute;
 	// As ClearRectangle.
 	int entireX1 = std::min(v0.screenpos.x, v1.screenpos.x);
@@ -3223,7 +3247,7 @@ bool PackClearRect(const VertexData &v0, const VertexData &v1, const BinCoords &
 	return true;
 }
 
-bool PackSprite(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims) {
+bool PackSprite(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
 	using namespace SoftCompute;
 	// As DrawSprite.
 	DrawingCoords pos0 = TransformUnit::ScreenToDrawing(v0.screenpos);
@@ -3266,7 +3290,7 @@ bool PackSprite(const VertexData &v0, const VertexData &v1, const BinCoords &ran
 }
 
 // Fragments, which the shader draws as ApplyFragment does.
-static void PushFragment(std::vector<uint32_t> &prims, const PixelFragment &frag) {
+static void PushFragment(SoftCompute::PrimWords &prims, const PixelFragment &frag) {
 	using namespace SoftCompute;
 	prims.push_back((uint32_t)(frag.x & 0xFFFF) | ((uint32_t)frag.y << 16));
 	prims.push_back((uint32_t)frag.z);
@@ -3282,7 +3306,7 @@ static void PushFragment(std::vector<uint32_t> &prims, const PixelFragment &frag
 	prims.push_back(0);
 }
 
-bool PackLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims) {
+bool PackLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
 	using namespace SoftCompute;
 	const size_t start = prims.size();
 	BeginPrim(prims, PrimType::FRAGMENTS, 0, stateIndex, 0, 0, 0, 0);
@@ -3307,7 +3331,7 @@ bool PackLine(const VertexData &v0, const VertexData &v1, const BinCoords &range
 	return true;
 }
 
-bool PackPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, std::vector<uint32_t> &prims) {
+bool PackPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
 	using namespace SoftCompute;
 	const PixelFragment frag = PointFragment(v0, state);
 	BeginPrim(prims, PrimType::FRAGMENTS, 0, stateIndex, frag.x, frag.y, frag.x, frag.y);
