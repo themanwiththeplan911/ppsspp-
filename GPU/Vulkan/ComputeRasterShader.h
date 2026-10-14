@@ -50,6 +50,27 @@ layout(push_constant) uniform Params {
 	uint cacheState;
 } pc;
 
+// What a segment's primitives use, so a variant of the shader can leave the rest out (ComputeRasterVulkan.cpp
+// picks it). All true is the shader that draws everything.
+layout(constant_id = SPEC_TEXTURE) const bool USE_TEXTURE = true;
+layout(constant_id = SPEC_CLUT) const bool USE_CLUT = true;
+layout(constant_id = SPEC_DXT) const bool USE_DXT = true;
+layout(constant_id = SPEC_BILINEAR) const bool USE_BILINEAR = true;
+layout(constant_id = SPEC_MIPS) const bool USE_MIPS = true;
+layout(constant_id = SPEC_FOG) const bool USE_FOG = true;
+layout(constant_id = SPEC_ALPHATEST) const bool USE_ALPHATEST = true;
+layout(constant_id = SPEC_COLORTEST) const bool USE_COLORTEST = true;
+layout(constant_id = SPEC_STENCIL) const bool USE_STENCIL = true;
+layout(constant_id = SPEC_DEPTH) const bool USE_DEPTH = true;
+layout(constant_id = SPEC_BLEND) const bool USE_BLEND = true;
+layout(constant_id = SPEC_LOGICOP) const bool USE_LOGICOP = true;
+layout(constant_id = SPEC_DITHER) const bool USE_DITHER = true;
+layout(constant_id = SPEC_WRITEMASK) const bool USE_WRITEMASK = true;
+layout(constant_id = SPEC_CLEAR) const bool USE_CLEAR = true;
+layout(constant_id = SPEC_FRAGMENTS) const bool USE_FRAGMENTS = true;
+layout(constant_id = SPEC_RECTS) const bool USE_RECTS = true;
+layout(constant_id = SPEC_WIDE) const bool USE_WIDE = true;
+
 const uint CACHE_COLOR = 1u;
 const uint CACHE_DEPTH = 2u;
 
@@ -329,7 +350,7 @@ int64_t Load64(uint o) {
 }
 
 int64_t PlaneSum(uint o, bool fits32, int xc, int yc) {
-	if (fits32)
+	if (!USE_WIDE || fits32)
 		return int64_t(int(data[o] + data[o + 2u] * uint(xc) + data[o + 4u] * uint(yc)));
 	return Load64(o) + Load64(o + 2u) * int64_t(xc) + Load64(o + 4u) * int64_t(yc);
 }
@@ -343,7 +364,7 @@ int64_t PlaneValue64(uint o, bool fits32, int xc, int yc) {
 }
 
 bool EdgeInside(uint o, bool fits32, int xc, int yc) {
-	if (fits32)
+	if (!USE_WIDE || fits32)
 		return int(data[o] * uint(xc) + data[o + 1u] * uint(yc) + data[o + 2u]) >= 0;
 	return int64_t(int(data[o])) * int64_t(xc) + int64_t(int(data[o + 1u])) * int64_t(yc) + Load64(o + 2u) >= int64_t(0);
 }
@@ -358,7 +379,8 @@ uint TexBits(uint fmt) {
 	default: return 16u;
 	}
 }
-
+)",
+R"(
 uint TexAddr(uint base, uint flags, uint offset) {
 	uint a = base + offset;
 	if ((flags & LV_VRAM) != 0u)
@@ -414,8 +436,7 @@ uint DXTTexelColor(uint block, uint x, uint y, int alpha) {
 		return 0u;
 	return MakeCol((red1 + red2) / 2, (green1 + green2) / 2, (blue1 + blue2) / 2, alpha);
 }
-)",
-R"(
+
 uint DXT5Lerp(uint alpha1, uint alpha2, uint n, uint steps) {
 	const uint a1 = (alpha1 * ((steps - n) << 8)) / steps;
 	const uint a2 = (alpha2 * (n << 8)) / steps;
@@ -462,7 +483,7 @@ uint ReadTexel(uint st, int level, uint u, uint v) {
 	const uint base = data[lv + 2u];
 	const uint samplerBits = data[st + ST_SAMPLER];
 	const uint fmt = (samplerBits >> SM_TEXFMT_SHIFT) & 0xFu;
-	if (fmt >= TFMT_DXT1)
+	if (USE_DXT && fmt >= TFMT_DXT1)
 		return DXTTexel(fmt, base, flags, bufw, u, v);
 
 	const uint bits = TexBits(fmt);
@@ -487,10 +508,12 @@ uint ReadTexel(uint st, int level, uint u, uint v) {
 	case TFMT_5551: return RGBA5551ToRGBA8888(MemRead16(addr));
 	case TFMT_5650: return RGB565ToRGBA8888(MemRead16(addr));
 	case TFMT_8888: return MemRead32(addr);
-	case TFMT_CLUT32: return LookupClut(st, ClutIndex(st, MemRead32(addr)) + clutOffset);
-	case TFMT_CLUT16: return LookupClut(st, ClutIndex(st, MemRead16(addr)) + clutOffset);
-	case TFMT_CLUT8: return LookupClut(st, ClutIndex(st, MemRead8(addr)) + clutOffset);
+	case TFMT_CLUT32: if (!USE_CLUT) return 0u; return LookupClut(st, ClutIndex(st, MemRead32(addr)) + clutOffset);
+	case TFMT_CLUT16: if (!USE_CLUT) return 0u; return LookupClut(st, ClutIndex(st, MemRead16(addr)) + clutOffset);
+	case TFMT_CLUT8: if (!USE_CLUT) return 0u; return LookupClut(st, ClutIndex(st, MemRead8(addr)) + clutOffset);
 	default: {
+		if (!USE_CLUT)
+			return 0u;
 		const uint b = MemRead8(addr);
 		return LookupClut(st, ClutIndex(st, (u & 1u) != 0u ? (b >> 4) : (b & 0xFu)) + clutOffset);
 	}
@@ -536,7 +559,8 @@ ivec4 SampleTexture(uint st, int level, int levelFrac, bool bilinear, uint sBits
 	const uint samplerBits = data[st + ST_SAMPLER];
 	const bool clampS = (samplerBits & SM_CLAMPS) != 0u;
 	const bool clampT = (samplerBits & SM_CLAMPT) != 0u;
-	const int levels = levelFrac != 0 ? 2 : 1;
+	bilinear = USE_BILINEAR && bilinear;
+	const int levels = USE_MIPS && levelFrac != 0 ? 2 : 1;
 	const int texels = bilinear ? 4 : 1;
 	ivec4 result[2] = ivec4[2](ivec4(0), ivec4(0));
 	for (int l = 0; l < levels; ++l) {
@@ -575,7 +599,7 @@ ivec4 SampleTexture(uint st, int level, int levelFrac, bool bilinear, uint sBits
 			result[l] = c[0];
 		}
 	}
-	if (levelFrac != 0)
+	if (USE_MIPS && levelFrac != 0)
 		return (result[1] * levelFrac + result[0] * (16 - levelFrac)) >> 4;
 	return result[0];
 }
@@ -613,7 +637,7 @@ void SamplingParams(uint st, int detail, out int level, out int levelFrac, out b
 	const uint samplerBits = data[st + ST_SAMPLER];
 	const int maxLevel = int((data[st + ST_TEXLEVEL] >> 8) & 0xFFu);
 	detail += int(data[st + ST_TEXLEVEL] << 24) >> 24;
-	if (detail > 0 && maxLevel > 0) {
+	if (USE_MIPS && detail > 0 && maxLevel > 0) {
 		const bool mipFilt = (samplerBits & SM_MIPFILT) != 0u;
 		int level8 = min(detail, maxLevel * 16);
 		if (!mipFilt)
@@ -675,7 +699,8 @@ void FBWrite16(uint addr, uint v) {
 		MemWrite16(addr, v);
 	}
 }
-
+)",
+R"(
 void FBWrite32(uint addr, uint v) {
 	if ((pc.cacheFlags & CACHE_COLOR) != 0u) {
 		gColor[gPix] = v;
@@ -726,7 +751,7 @@ bool DepthTestPassed(uint st, int func, int x, int y, int z) {
 // The depth range and depth tests some primitives do before texturing (earlyZChecks).
 bool EarlyZPassed(uint st, int x, int y, int z) {
 	const uint px0 = data[st + ST_PIXEL0];
-	if ((px0 & PX0_EARLYZ) == 0u)
+	if (!USE_DEPTH || (px0 & PX0_EARLYZ) == 0u)
 		return true;
 	if ((px0 & PX0_DEPTHRANGE) != 0u && (z < int(data[st + ST_MINZ]) || z > int(data[st + ST_MAXZ])))
 		return false;
@@ -767,8 +792,7 @@ void WriteColor(uint fmt, uint addr, uint value, uint oldValue, uint writeMask) 
 		break;
 	}
 }
-)",
-R"(
+
 uint ReadStencil(uint fmt, uint addr) {
 	switch (fmt) {
 	case FMT_565: return 0u;
@@ -899,19 +923,19 @@ ivec3 AlphaBlend(uint st, ivec4 src, ivec4 dst) {
 void DrawPixel(uint st, int x, int y, int z, int fog, ivec4 color) {
 	const uint px0 = data[st + ST_PIXEL0];
 	const uint px1 = data[st + ST_PIXEL1];
-	const bool clearMode = (px0 & PX0_CLEAR) != 0u;
+	const bool clearMode = USE_CLEAR && (px0 & PX0_CLEAR) != 0u;
 	const bool earlyZ = (px0 & PX0_EARLYZ) != 0u;
 	const uint fmt = (px0 >> PX0_FBFORMAT_SHIFT) & 3u;
 	const uint refs = data[st + ST_REFS];
 	color = clamp(color, ivec4(0), ivec4(255));
 
-	if ((px0 & PX0_DEPTHRANGE) != 0u && !earlyZ) {
+	if (USE_DEPTH && (px0 & PX0_DEPTHRANGE) != 0u && !earlyZ) {
 		if (z < int(data[st + ST_MINZ]) || z > int(data[st + ST_MAXZ]))
 			return;
 	}
 
 	const int alphaFunc = int((px0 >> PX0_ALPHATEST_SHIFT) & 7u);
-	if (alphaFunc != COMP_ALWAYS && !clearMode) {
+	if (USE_ALPHATEST && alphaFunc != COMP_ALWAYS && !clearMode) {
 		int a = color.a;
 		if ((px0 & PX0_ALPHATESTMASK) != 0u)
 			a &= int((refs >> 16) & 0xFFu);
@@ -919,12 +943,12 @@ void DrawPixel(uint st, int x, int y, int z, int fog, ivec4 color) {
 			return;
 	}
 
-	if ((px0 & PX0_FOG) != 0u && !clearMode) {
+	if (USE_FOG && (px0 & PX0_FOG) != 0u && !clearMode) {
 		const ivec3 fogColor = Unpack(data[st + ST_FOGCOLOR]).rgb;
 		color.rgb = (color.rgb * fog + fogColor * (255 - fog) + ivec3(255)) >> 8;
 	}
 
-	if ((px0 & PX0_COLORTEST) != 0u && !clearMode) {
+	if (USE_COLORTEST && (px0 & PX0_COLORTEST) != 0u && !clearMode) {
 		const uint c = PackRGB(color.rgb) & data[st + ST_CTEST_MASK];
 		const uint ref = data[st + ST_CTEST_REF];
 		const uint func = (data[st + ST_MISC] >> 16) & 0xFFu;
@@ -936,15 +960,15 @@ void DrawPixel(uint st, int x, int y, int z, int fog, ivec4 color) {
 			return;
 	}
 
-	const uint writeMask = (px0 & PX0_WRITEMASK) != 0u ? data[st + ST_WRITEMASK] : 0u;
+	const uint writeMask = USE_WRITEMASK && (px0 & PX0_WRITEMASK) != 0u ? data[st + ST_WRITEMASK] : 0u;
 	const uint bpp = fmt == FMT_8888 ? 4u : 2u;
 	const uint fbAddr = (pc.cacheFlags & CACHE_COLOR) != 0u ? 0u : FBAddr(st, x, y, bpp);
 	const int depthFunc = int((px0 >> PX0_DEPTHTEST_SHIFT) & 7u);
 	uint stencil = clearMode ? uint(color.a) : ReadStencil(fmt, fbAddr);
 	if (clearMode) {
-		if ((px0 & PX0_DEPTHWRITE) != 0u)
+		if (USE_DEPTH && (px0 & PX0_DEPTHWRITE) != 0u)
 			DepthWrite(st, x, y, uint(z));
-	} else if ((px0 & PX0_STENCILTEST) != 0u) {
+	} else if (USE_STENCIL && (px0 & PX0_STENCILTEST) != 0u) {
 		const uint stencilReplace = (px0 & PX0_STENCILTESTMASK) != 0u ? (data[st + ST_MISC] & 0xFFu) : ((refs >> 8) & 0xFFu);
 		uint testStencil = stencil;
 		if ((px0 & PX0_STENCILTESTMASK) != 0u)
@@ -955,32 +979,32 @@ void DrawPixel(uint st, int x, int y, int z, int fog, ivec4 color) {
 			WriteStencil(fmt, fbAddr, writeMask, stencil);
 			return;
 		}
-		if (!earlyZ && depthFunc != COMP_ALWAYS && !DepthTestPassed(st, depthFunc, x, y, z & 0xFFFF)) {
+		if (USE_DEPTH && !earlyZ && depthFunc != COMP_ALWAYS && !DepthTestPassed(st, depthFunc, x, y, z & 0xFFFF)) {
 			stencil = StencilOp(fmt, stencilReplace, (px1 >> PX1_ZFAIL_SHIFT) & 7u, stencil);
 			WriteStencil(fmt, fbAddr, writeMask, stencil);
 			return;
 		}
 		stencil = StencilOp(fmt, stencilReplace, (px1 >> PX1_ZPASS_SHIFT) & 7u, stencil);
 	} else if (!earlyZ) {
-		if (depthFunc != COMP_ALWAYS && !DepthTestPassed(st, depthFunc, x, y, z & 0xFFFF))
+		if (USE_DEPTH && depthFunc != COMP_ALWAYS && !DepthTestPassed(st, depthFunc, x, y, z & 0xFFFF))
 			return;
 	}
 
-	if ((px0 & PX0_DEPTHWRITE) != 0u && !clearMode)
+	if (USE_DEPTH && (px0 & PX0_DEPTHWRITE) != 0u && !clearMode)
 		DepthWrite(st, x, y, uint(z));
 
 	const uint oldColor = ReadColor(fmt, fbAddr);
 	uint newColor;
 	// Dithering happens before the logic op and regardless of framebuffer format or clear mode.
-	const int dither = (px0 & PX0_DITHER) != 0u ? int(data[st + ST_DITHER + uint(y & 3)] << (24u - 8u * uint(x & 3))) >> 24 : 0;
-	if ((px0 & PX0_ALPHABLEND) != 0u && !clearMode) {
+	const int dither = USE_DITHER && (px0 & PX0_DITHER) != 0u ? int(data[st + ST_DITHER + uint(y & 3)] << (24u - 8u * uint(x & 3))) >> 24 : 0;
+	if (USE_BLEND && (px0 & PX0_ALPHABLEND) != 0u && !clearMode) {
 		const ivec3 blended = AlphaBlend(st, color, Unpack(oldColor)) + ivec3(dither);
 		newColor = PackRGB(blended) | (stencil << 24);
 	} else {
 		newColor = PackRGB(color.rgb + ivec3(dither)) | (stencil << 24);
 	}
 
-	if ((px0 & PX0_LOGICOP) != 0u && !clearMode)
+	if (USE_LOGICOP && (px0 & PX0_LOGICOP) != 0u && !clearMode)
 		newColor = LogicOp((data[st + ST_MISC] >> 8) & 0xFFu, oldColor, newColor);
 
 	if (clearMode) {
@@ -1026,7 +1050,8 @@ bool TriangleFragment(uint prim, uint st, int x, int y, out Frag f) {
 	const bool e32 = (flags & PRIMF_EDGES32) != 0u;
 	const bool p32 = (flags & PRIMF_PLANES32) != 0u;
 	const int xc = x * 16 + 8, yc = y * 16 + 8;
-
+)",
+R"(
 	const uint snap = data[d + TRI_SNAP];
 	const int snapEdge = int(snap << 24) >> 24;
 	for (int k = 0; k < 3; ++k) {
@@ -1079,11 +1104,11 @@ bool TriangleFragment(uint prim, uint st, int x, int y, out Frag f) {
 	if (DoubleSecondary(st))
 		f.sec *= 2;
 
-	f.textured = (flags & PRIMF_UV) != 0u;
+	f.textured = USE_TEXTURE && (flags & PRIMF_UV) != 0u;
 	if (f.textured) {
 		const int expS = int(data[d + TRI_EXP_S]), expT = int(data[d + TRI_EXP_T]), expQ = int(data[d + TRI_EXP_Q]);
 		uint q;
-		if (p32)
+		if (!USE_WIDE || p32)
 			UVFromPlanes32(PlaneValue(plane, true, xc, yc), PlaneValue(plane + 6u, true, xc, yc), PlaneValue(plane + 12u, true, xc, yc), expQ, expS, expT, f.s, f.t, q);
 		else
 			UVFromPlanes(PlaneValue64(plane, false, xc, yc), PlaneValue64(plane + 6u, false, xc, yc), PlaneValue64(plane + 12u, false, xc, yc), expQ, expS, expT, f.s, f.t, q);
@@ -1102,7 +1127,7 @@ bool TriangleFragment(uint prim, uint st, int x, int y, out Frag f) {
 					}
 				}
 			}
-			q = p32 ? ToFloat24Fast(PlaneValue(plane, true, pick * 16 + 8, yc), expQ) : ToFloat24(PlaneValue64(plane, false, pick * 16 + 8, yc), expQ);
+			q = !USE_WIDE || p32 ? ToFloat24Fast(PlaneValue(plane, true, pick * 16 + 8, yc), expQ) : ToFloat24(PlaneValue64(plane, false, pick * 16 + 8, yc), expQ);
 		}
 		if ((flags & PRIMF_THROUGH_UV) != 0u) {
 			const uint shifts = data[st + ST_TEXLEVEL];
@@ -1116,8 +1141,7 @@ bool TriangleFragment(uint prim, uint st, int x, int y, out Frag f) {
 	}
 	return true;
 }
-)",
-R"(
+
 bool RectFragment(uint prim, uint st, int x, int y, out Frag f) {
 	const uint flags = data[prim + PRIM_TYPE_FLAGS];
 	const uint d = prim + PRIM_HEADER_WORDS;
@@ -1129,13 +1153,13 @@ bool RectFragment(uint prim, uint st, int x, int y, out Frag f) {
 	f.sec = Unpack(data[d + RECT_C1]).rgb;
 	if (DoubleSecondary(st))
 		f.sec *= 2;
-	f.textured = (flags & PRIMF_UV) != 0u;
+	f.textured = USE_TEXTURE && (flags & PRIMF_UV) != 0u;
 	if (f.textured) {
 		const bool p32 = (flags & PRIMF_PLANES32) != 0u;
 		const int xc = x * 16 + 8, yc = y * 16 + 8;
 		const uint plane = d + RECT_PLANES;
 		uint q;
-		if (p32)
+		if (!USE_WIDE || p32)
 			UVFromPlanes32(PlaneValue(plane, true, xc, yc), PlaneValue(plane + 6u, true, xc, yc), PlaneValue(plane + 12u, true, xc, yc), int(data[d + RECT_EXP_Q]), int(data[d + RECT_EXP_S]), int(data[d + RECT_EXP_T]), f.s, f.t, q);
 		else
 			UVFromPlanes(PlaneValue64(plane, false, xc, yc), PlaneValue64(plane + 6u, false, xc, yc), PlaneValue64(plane + 12u, false, xc, yc), int(data[d + RECT_EXP_Q]), int(data[d + RECT_EXP_S]), int(data[d + RECT_EXP_T]), f.s, f.t, q);
@@ -1156,7 +1180,7 @@ bool SpriteFragment(uint prim, uint st, int x, int y, out Frag f) {
 	f.fog = 255;
 	f.color = Unpack(data[d + SPRITE_C0]);
 	f.sec = ivec3(0);
-	f.textured = (flags & PRIMF_TEXTURED) != 0u;
+	f.textured = USE_TEXTURE && (flags & PRIMF_TEXTURED) != 0u;
 	if (f.textured) {
 		// The texel 1:1, at level 0: as a coordinate, its center comes out as that texel.
 		const uint xy1 = data[prim + PRIM_XY1];
@@ -1190,7 +1214,7 @@ bool NextFragment(uint prim, uint st, int x, int y, inout uint index, out Frag f
 		f.color = Unpack(data[frag + FRAGW_C0]);
 		const uint sec = data[frag + FRAGW_C1];
 		f.sec = ivec3(int(sec & 0x3FFu), int((sec >> 10) & 0x3FFu), int((sec >> 20) & 0x3FFu));
-		f.textured = (fogFlags & 0x100u) != 0u;
+		f.textured = USE_TEXTURE && (fogFlags & 0x100u) != 0u;
 		f.s = data[frag + FRAGW_S];
 		f.t = data[frag + FRAGW_T];
 		f.level = int((fogFlags >> 16) & 0xFFu);
@@ -1205,7 +1229,7 @@ void DrawClearRect(uint prim, uint st, int x, int y) {
 	const uint d = prim + PRIM_HEADER_WORDS;
 	const uint px0 = data[st + ST_PIXEL0];
 	const uint fmt = (px0 >> PX0_FBFORMAT_SHIFT) & 3u;
-	if ((px0 & PX0_DEPTHWRITE) != 0u)
+	if (USE_DEPTH && (px0 & PX0_DEPTHWRITE) != 0u)
 		DepthWrite(st, x, y, data[d + CLEAR_Z]);
 
 	// ClearRectangle's mask of what to keep.
@@ -1233,7 +1257,7 @@ void DrawClearRect(uint prim, uint st, int x, int y) {
 		else if (stencilClear)
 			keepOldMask = 0x00FFFFFFu;
 	}
-	if ((px0 & PX0_WRITEMASK) != 0u)
+	if (USE_WRITEMASK && (px0 & PX0_WRITEMASK) != 0u)
 		keepOldMask |= data[st + ST_WRITEMASK];
 	if (keepOldMask == 0xFFFFFFFFu)
 		return;
@@ -1262,11 +1286,11 @@ void DrawPrim(uint prim, int x, int y) {
 		return;
 	const uint st = pc.statesOffset + data[prim + PRIM_STATE] * ST_WORDS;
 	const uint type = data[prim + PRIM_TYPE_FLAGS] & 0xFu;
-	if (type == 3u) {
+	if (USE_CLEAR && type == 3u) {
 		DrawClearRect(prim, st, x, y);
 		return;
 	}
-	const bool clearMode = (data[st + ST_PIXEL0] & PX0_CLEAR) != 0u;
+	const bool clearMode = USE_CLEAR && (data[st + ST_PIXEL0] & PX0_CLEAR) != 0u;
 	uint index = 0u;
 	[[dont_unroll]]
 	while (true) {
@@ -1274,15 +1298,17 @@ void DrawPrim(uint prim, int x, int y) {
 		bool any;
 		if (type == 0u)
 			any = index++ == 0u && TriangleFragment(prim, st, x, y, f);
-		else if (type == 1u)
+		else if (USE_RECTS && type == 1u)
 			any = index++ == 0u && RectFragment(prim, st, x, y, f);
-		else if (type == 2u)
+		else if (USE_RECTS && type == 2u)
 			any = index++ == 0u && SpriteFragment(prim, st, x, y, f);
-		else
+		else if (USE_FRAGMENTS)
 			any = NextFragment(prim, st, x, y, index, f);
+		else
+			any = false;
 		if (!any)
 			break;
-		if (f.textured)
+		if (USE_TEXTURE && f.textured)
 			f.color = ApplyTexturing(st, f.color, f.s, f.t, f.level, f.levelFrac, f.bilinear);
 		if (!clearMode)
 			f.color.rgb += f.sec;

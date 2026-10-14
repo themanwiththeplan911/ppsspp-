@@ -32,6 +32,7 @@ struct CommandLineOptions {
 	std::optional<GPUBackend> gpuBackend;
 	std::optional<bool> softwareRendering;
 	std::optional<bool> softwareCpuRaster;
+	std::optional<int> softwareComputeVariants;
 	std::optional<bool> enableLogging;
 	std::optional<LogLevel> logLevel;  // Override log level with this.
 	std::optional<std::string> log;

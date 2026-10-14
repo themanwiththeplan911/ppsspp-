@@ -18,9 +18,14 @@
 #include "ppsspp_config.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "Common/Data/Text/StringWriter.h"
@@ -29,6 +34,7 @@
 #include "Common/GPU/Vulkan/VulkanRenderManager.h"
 #include "Common/Log.h"
 #include "Common/StringUtils.h"
+#include "Common/Thread/ThreadUtil.h"
 #include "Common/TimeUtil.h"
 #include "Core/Config.h"
 #include "Core/MemMap.h"
@@ -76,6 +82,38 @@ enum : uint32_t {
 	CACHE_DEPTH = 2,
 };
 
+// The shader's specialization constants, one bit each in a variant's mask: what a segment uses.
+enum Spec : uint32_t {
+	SPEC_TEXTURE,
+	SPEC_CLUT,
+	SPEC_DXT,
+	SPEC_BILINEAR,
+	SPEC_MIPS,
+	SPEC_FOG,
+	SPEC_ALPHATEST,
+	SPEC_COLORTEST,
+	SPEC_STENCIL,
+	SPEC_DEPTH,
+	SPEC_BLEND,
+	SPEC_LOGICOP,
+	SPEC_DITHER,
+	SPEC_WRITEMASK,
+	SPEC_CLEAR,
+	SPEC_FRAGMENTS,
+	SPEC_RECTS,
+	// Primitives whose edges or planes need 64-bit sums.
+	SPEC_WIDE,
+	SPEC_COUNT,
+};
+
+static const char *const specNames[SPEC_COUNT] = {
+	"SPEC_TEXTURE", "SPEC_CLUT", "SPEC_DXT", "SPEC_BILINEAR", "SPEC_MIPS", "SPEC_FOG", "SPEC_ALPHATEST", "SPEC_COLORTEST",
+	"SPEC_STENCIL", "SPEC_DEPTH", "SPEC_BLEND", "SPEC_LOGICOP", "SPEC_DITHER", "SPEC_WRITEMASK", "SPEC_CLEAR",
+	"SPEC_FRAGMENTS", "SPEC_RECTS", "SPEC_WIDE",
+};
+
+static constexpr uint32_t SPEC_ALL = (1U << SPEC_COUNT) - 1;
+
 static void AddDefine(std::string &s, const char *name, uint32_t value) {
 	s += StringFromFormat("#define %s %uu\n", name, value);
 }
@@ -113,6 +151,8 @@ static std::string ShaderSource() {
 	DEFINE(SM_LEVELMODE_SHIFT); DEFINE(SM_CLUTTRANSFORM); DEFINE(SM_FORCE_LINEAR); DEFINE(SM_FORCE_NEAREST);
 	DEFINE(LV_VALID); DEFINE(LV_VRAM);
 #undef DEFINE
+	for (int i = 0; i < SPEC_COUNT; ++i)
+		s += StringFromFormat("#define %s %d\n", specNames[i], i);
 	s += "const ivec2 GE_RECIP[128] = ivec2[128](";
 	for (int i = 0; i < 128; ++i)
 		s += StringFromFormat("%sivec2(%d, %d)", i == 0 ? "" : ", ", geRecipSegments[i].b, geRecipSegments[i].m);
@@ -170,6 +210,8 @@ private:
 		// How the shader can keep pixels in registers (CacheFlags), with the state that has the buffers.
 		uint32_t cacheFlags;
 		uint32_t cacheState;
+		// What its primitives use (Spec bits).
+		uint32_t features;
 		// COPY: within the memory buffer.
 		uint32_t src;
 		uint32_t dst;
@@ -188,7 +230,11 @@ private:
 	uint8_t *AllocStaging(size_t bytes, VkBuffer *buffer, VkDeviceSize *offset);
 
 	void Submit();
-	void SegmentCaching(Op &op);
+	void SegmentSetup(Op &op);
+	uint32_t PrimFeatures(uint32_t off, const uint32_t *st) const;
+	VkPipeline CreateVariant(uint32_t mask);
+	VkPipeline Variant(uint32_t mask);
+	void CompileThread();
 	void ResetBatch();
 	template <typename F>
 	void ForPrimTiles(uint32_t off, F f);
@@ -205,7 +251,18 @@ private:
 
 	VkDescriptorSetLayout descSetLayout_ = VK_NULL_HANDLE;
 	VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+	// The shader that draws everything (all specialization constants true), and the variants made so far.
 	VkPipeline pipeline_ = VK_NULL_HANDLE;
+	VkShaderModule module_ = VK_NULL_HANDLE;
+	int variantMode_ = 0;
+	std::mutex variantMutex_;
+	std::unordered_map<uint32_t, VkPipeline> variants_;
+	// Asked for and not made yet, and what the compile thread is to make.
+	std::unordered_set<uint32_t> variantsPending_;
+	std::deque<uint32_t> compileQueue_;
+	std::condition_variable compileCond_;
+	std::thread compileThread_;
+	bool compileStop_ = false;
 	VkDescriptorPool descPool_ = VK_NULL_HANDLE;
 	VkDescriptorSet descSet_ = VK_NULL_HANDLE;
 	int descSetsLeft_ = 0;
@@ -366,21 +423,17 @@ bool ComputeRasterVulkan::Init() {
 
 	std::string error;
 	const std::string source = ShaderSource();
-	VkShaderModule module = CompileShaderModule(vulkan_, VK_SHADER_STAGE_COMPUTE_BIT, source.c_str(), &error);
-	if (!module) {
+	module_ = CompileShaderModule(vulkan_, VK_SHADER_STAGE_COMPUTE_BIT, source.c_str(), &error);
+	if (!module_) {
 		ERROR_LOG(Log::G3D, "Software compute: shader failed to compile: %s", error.c_str());
 		return false;
 	}
-	VkComputePipelineCreateInfo pci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-	pci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-	pci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-	pci.stage.module = module;
-	pci.stage.pName = "main";
-	pci.layout = pipelineLayout_;
-	VkResult res = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline_);
-	vulkan_->Delete().QueueDeleteShaderModule(module);
-	if (res != VK_SUCCESS)
+	pipeline_ = CreateVariant(SPEC_ALL);
+	if (pipeline_ == VK_NULL_HANDLE)
 		return false;
+	variantMode_ = g_Config.iSoftwareComputeVariants;
+	if (variantMode_ == 0)
+		compileThread_ = std::thread([this] { CompileThread(); });
 	if (!UpdateDescriptorSet())
 		return false;
 
@@ -421,8 +474,20 @@ ComputeRasterVulkan::~ComputeRasterVulkan() {
 	DestroyBuffer(readback_);
 	for (Buffer &buf : staging_)
 		DestroyBuffer(buf);
+	if (compileThread_.joinable()) {
+		{
+			std::lock_guard<std::mutex> guard(variantMutex_);
+			compileStop_ = true;
+		}
+		compileCond_.notify_one();
+		compileThread_.join();
+	}
+	for (auto &it : variants_)
+		vulkan_->Delete().QueueDeletePipeline(it.second);
 	if (pipeline_ != VK_NULL_HANDLE)
 		vulkan_->Delete().QueueDeletePipeline(pipeline_);
+	if (module_ != VK_NULL_HANDLE)
+		vulkan_->Delete().QueueDeleteShaderModule(module_);
 	if (pipelineLayout_ != VK_NULL_HANDLE)
 		vulkan_->Delete().QueueDeletePipelineLayout(pipelineLayout_);
 	if (descSetLayout_ != VK_NULL_HANDLE)
@@ -873,12 +938,141 @@ void ComputeRasterVulkan::ForPrimTiles(uint32_t off, F f) {
 }
 
 // Records the batch for the GPU (it runs with the frame's init commands, or at the next sync).
-// Whether the shader can keep a segment's pixels in registers until it's done: every primitive draws to the same
-// color (and depth) buffer, no pixel is another's (a primitive reaching past the stride wraps into the next
-// row), and the color and depth don't overlap.
-void ComputeRasterVulkan::SegmentCaching(Op &op) {
+// What a segment's primitives use (the shader variant), and whether the shader can keep its pixels in registers
+// until it's done: every primitive draws to the same color (and depth) buffer, no pixel is another's (a primitive
+// reaching past the stride wraps into the next row), and the color and depth don't overlap.
+uint32_t ComputeRasterVulkan::PrimFeatures(uint32_t off, const uint32_t *st) const {
+	uint32_t f = 0;
+	auto use = [&](Spec s) {
+		f |= 1U << s;
+	};
+	const uint32_t px0 = st[ST_PIXEL0];
+	const uint32_t sampler = st[ST_SAMPLER];
+	if (px0 & PX0_CLEAR) {
+		use(SPEC_CLEAR);
+	} else {
+		if (((px0 >> PX0_ALPHATEST_SHIFT) & 7) != GE_COMP_ALWAYS)
+			use(SPEC_ALPHATEST);
+		if (px0 & PX0_FOG)
+			use(SPEC_FOG);
+		if (px0 & PX0_COLORTEST)
+			use(SPEC_COLORTEST);
+		if (px0 & PX0_STENCILTEST)
+			use(SPEC_STENCIL);
+		if (px0 & PX0_ALPHABLEND)
+			use(SPEC_BLEND);
+		if (px0 & PX0_LOGICOP)
+			use(SPEC_LOGICOP);
+	}
+	if ((px0 & (PX0_DEPTHWRITE | PX0_DEPTHRANGE | PX0_EARLYZ)) != 0 || ((px0 >> PX0_DEPTHTEST_SHIFT) & 7) != GE_COMP_ALWAYS)
+		use(SPEC_DEPTH);
+	if (px0 & PX0_DITHER)
+		use(SPEC_DITHER);
+	if (px0 & PX0_WRITEMASK)
+		use(SPEC_WRITEMASK);
+	if (sampler & SM_TEXTURES) {
+		use(SPEC_TEXTURE);
+		const uint32_t fmt = (sampler >> SM_TEXFMT_SHIFT) & 0xF;
+		if (fmt >= GE_TFMT_CLUT4 && fmt <= GE_TFMT_CLUT32)
+			use(SPEC_CLUT);
+		else if (fmt >= GE_TFMT_DXT1)
+			use(SPEC_DXT);
+		if (sampler & (SM_MINFILT | SM_MAGFILT | SM_FORCE_LINEAR))
+			use(SPEC_BILINEAR);
+		if (((st[ST_TEXLEVEL] >> 8) & 0xFF) != 0)
+			use(SPEC_MIPS);
+	}
+
+	const uint32_t typeFlags = prims_[off + PRIM_TYPE_FLAGS];
+	switch ((PrimType)(typeFlags & 0xF)) {
+	case PrimType::TRIANGLE:
+		if ((typeFlags & (PRIMF_EDGES32 | PRIMF_PLANES32)) != (PRIMF_EDGES32 | PRIMF_PLANES32))
+			use(SPEC_WIDE);
+		break;
+	case PrimType::RECT:
+		use(SPEC_RECTS);
+		if ((typeFlags & PRIMF_UV) && !(typeFlags & PRIMF_PLANES32))
+			use(SPEC_WIDE);
+		break;
+	case PrimType::SPRITE:
+		use(SPEC_RECTS);
+		break;
+	case PrimType::CLEAR_RECT:
+		use(SPEC_CLEAR);
+		break;
+	case PrimType::FRAGMENTS:
+		use(SPEC_FRAGMENTS);
+		break;
+	}
+	return f;
+}
+
+VkPipeline ComputeRasterVulkan::CreateVariant(uint32_t mask) {
+	VkBool32 values[SPEC_COUNT];
+	VkSpecializationMapEntry entries[SPEC_COUNT];
+	for (uint32_t i = 0; i < SPEC_COUNT; ++i) {
+		values[i] = (mask >> i) & 1;
+		entries[i] = { i, i * (uint32_t)sizeof(VkBool32), sizeof(VkBool32) };
+	}
+	VkSpecializationInfo spec{ SPEC_COUNT, entries, sizeof(values), values };
+	VkComputePipelineCreateInfo pci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+	pci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	pci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	pci.stage.module = module_;
+	pci.stage.pName = "main";
+	pci.stage.pSpecializationInfo = &spec;
+	pci.layout = pipelineLayout_;
+	VkPipeline pipeline = VK_NULL_HANDLE;
+	if (vkCreateComputePipelines(vulkan_->GetDevice(), VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline) != VK_SUCCESS)
+		return VK_NULL_HANDLE;
+	return pipeline;
+}
+
+// The pipeline for a segment that uses mask. Until its variant is made (in the background, unless the config
+// says to wait), the one that does everything.
+VkPipeline ComputeRasterVulkan::Variant(uint32_t mask) {
+	if (variantMode_ == 2 || mask == SPEC_ALL)
+		return pipeline_;
+	std::unique_lock<std::mutex> lock(variantMutex_);
+	auto it = variants_.find(mask);
+	if (it != variants_.end())
+		return it->second ? it->second : pipeline_;
+	if (variantMode_ == 1) {
+		lock.unlock();
+		VkPipeline pipeline = CreateVariant(mask);
+		lock.lock();
+		variants_[mask] = pipeline;
+		return pipeline ? pipeline : pipeline_;
+	}
+	if (variantsPending_.insert(mask).second) {
+		compileQueue_.push_back(mask);
+		compileCond_.notify_one();
+	}
+	return pipeline_;
+}
+
+void ComputeRasterVulkan::CompileThread() {
+	SetCurrentThreadName("SoftComputeCompile");
+	std::unique_lock<std::mutex> lock(variantMutex_);
+	while (true) {
+		compileCond_.wait(lock, [this] { return compileStop_ || !compileQueue_.empty(); });
+		if (compileStop_)
+			return;
+		const uint32_t mask = compileQueue_.front();
+		compileQueue_.pop_front();
+		lock.unlock();
+		// A failed one stays null, so the full shader keeps drawing those.
+		VkPipeline pipeline = CreateVariant(mask);
+		lock.lock();
+		variants_[mask] = pipeline;
+		variantsPending_.erase(mask);
+	}
+}
+
+void ComputeRasterVulkan::SegmentSetup(Op &op) {
 	op.cacheFlags = 0;
 	op.cacheState = 0;
+	op.features = 0;
 	if (op.first == op.end)
 		return;
 	const uint32_t *color = nullptr;
@@ -904,6 +1098,8 @@ void ComputeRasterVulkan::SegmentCaching(Op &op) {
 			else if (st[ST_Z_BASE] != depth[ST_Z_BASE] || (st[ST_STRIDES] >> 16) != (depth[ST_STRIDES] >> 16) || st[ST_Z_ROTMASK] != depth[ST_Z_ROTMASK] || st[ST_Z_ROTSHIFT] != depth[ST_Z_ROTSHIFT] || st[ST_Z_XOR] != depth[ST_Z_XOR])
 				depthOK = false;
 		}
+		op.features |= PrimFeatures(off, st);
+
 		const uint32_t xy1 = prims_[off + PRIM_XY1], xy2 = prims_[off + PRIM_XY2];
 		x2 = std::max(x2, xy2 & 0xFFFF);
 		y1 = std::min(y1, xy1 >> 16);
@@ -976,7 +1172,7 @@ void ComputeRasterVulkan::Submit() {
 		items.resize(pos);
 		for (uint64_t tp : tilePrims_)
 			items[tilePos_[tp & 0xFFFF]++] = (uint32_t)(tp >> 16);
-		SegmentCaching(op);
+		SegmentSetup(op);
 		statSegments_++;
 	}
 
@@ -1048,12 +1244,18 @@ void ComputeRasterVulkan::Submit() {
 		vkCmdResetQueryPool(cmd, queryPool_, queriesUsed_, 2);
 		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, queriesUsed_);
 	}
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &descSet_, 0, nullptr);
+	VkPipeline bound = VK_NULL_HANDLE;
 	for (const Op &op : ops_) {
 		if (op.type == Op::Type::SEGMENT) {
 			if (op.tileCount == 0)
 				continue;
+			const VkPipeline pipeline = Variant(op.features);
+			if (pipeline != bound) {
+				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+				if (bound == VK_NULL_HANDLE)
+					vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &descSet_, 0, nullptr);
+				bound = pipeline;
+			}
 			PushParams params{ statesOffset, primsOffset, tilesOffset + op.tileFirst * 3, itemsOffset, memBytes_, op.cacheFlags, statesOffset + op.cacheState * ST_WORDS };
 			vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), &params);
 			vkCmdDispatch(cmd, op.tileCount, 1, 1);

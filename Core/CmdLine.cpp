@@ -176,6 +176,13 @@ static ParseParamResult ParseParameterStr(int argc, const char *argv[], size_t &
 	return ParseParamResult::NoMatch;
 }
 
+// Enum for Config::iSoftwareComputeVariants
+const char *g_SoftwareComputeVariantsValues[] = {
+	"async",
+	"sync",
+	"off",
+};
+
 // Enum ExceptionAction
 const char *g_ExceptionActionValues[] = {
 	"default",
@@ -201,6 +208,7 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(bench), CmdParamType::Bool, "bench", 'b', "Enable benchmark mode", CmdLineMode::Headless},
 	{POFF(oldAtrac), CmdParamType::Bool, "old-atrac", '\0', "Use old ATRAC decoder"},
 	{POFF(softwareCpuRaster), CmdParamType::Bool, "soft-cpu-raster", '\0', "With the software renderer on Vulkan, rasterize on the CPU instead of with compute shaders"},
+	{POFF(softwareComputeVariants), CmdParamType::Enum, "soft-compute-variants", '\0', "Specialized compute shaders: compiled in the background, waited for, or off", CmdLineMode::Both, g_SoftwareComputeVariantsValues, ARRAY_SIZE(g_SoftwareComputeVariantsValues)},
 	{POFF(log), CmdParamType::String, "log", '\0', "Output log to FILE", CmdLineMode::Application},
 	{POFF(enableLogging), CmdParamType::Bool, "log", '\0', "Full log output, not just emulated printfs", CmdLineMode::Headless},
 	{POFF(screenshotFilename), CmdParamType::String, "screenshot", '\0', "Compare rendered output against a reference screenshot FILE", CmdLineMode::Headless},
@@ -551,6 +559,10 @@ void CommandLineOptions::ApplyToConfig() const {
 	if (softwareCpuRaster.has_value()) {
 		g_Config.bSoftwareRenderingCompute = !softwareCpuRaster.value();
 		g_Config.DoNotSaveSetting(&g_Config.bSoftwareRenderingCompute);
+	}
+	if (softwareComputeVariants.has_value()) {
+		g_Config.iSoftwareComputeVariants = softwareComputeVariants.value();
+		g_Config.DoNotSaveSetting(&g_Config.iSoftwareComputeVariants);
 	}
 	if (enableLogging.has_value()) {
 		g_Config.bEnableLogging = enableLogging.value();

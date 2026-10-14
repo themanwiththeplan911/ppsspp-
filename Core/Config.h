@@ -304,6 +304,9 @@ public:
 	bool bSoftwareRenderingJit;
 	// On Vulkan, the software renderer rasterizes with compute shaders unless this is off.
 	bool bSoftwareRenderingCompute;
+	// How it gets shaders specialized for what a segment uses: 0 compiles them in the background, 1 waits for
+	// them, 2 uses the one that does everything.
+	int iSoftwareComputeVariants;
 	bool bSoftwareDisableDithering;
 	bool bHardwareTransform;
 	bool bVendorBugChecksEnabled;
