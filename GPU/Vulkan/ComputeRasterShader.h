@@ -22,13 +22,13 @@
 static const char *const computeRasterShaderParts[] = {
 R"(// The software renderer's rasterizer, as a Vulkan compute shader (ComputeRasterVulkan.cpp, which prepends the
 // layout #defines from GPU/Software/ComputeRaster.h). A workgroup draws a 16x16 tile of a segment's primitives in
-// order, each invocation two pixels side by side (so 16-bit pixels don't share a word with another invocation).
+// order, an invocation per pixel (16-bit pixels are written to their half of the word atomically).
 // Everything mirrors GPU/Software: Rasterizer.cpp for coverage and interpolation, Sampler.cpp, and DrawPixel.cpp's
 // DrawPixelInline, down to the GE's own arithmetic (GEMath.h).
 
 #extension GL_EXT_control_flow_attributes : require
 
-layout(local_size_x = 8, local_size_y = 16, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(std430, set = 0, binding = 0) buffer MemBuf {
 	uint mem[];
@@ -114,10 +114,12 @@ uint MemRead8(uint addr) {
 	return (mem[addr >> 2] >> ((addr & 3u) << 3)) & 0xFFu;
 }
 
+// The other half of the word can be another invocation's pixel.
 void MemWrite16(uint addr, uint v) {
 	const uint i = addr >> 2;
 	const uint shift = (addr & 2u) << 3;
-	mem[i] = (mem[i] & ~(0xFFFFu << shift)) | ((v & 0xFFFFu) << shift);
+	atomicAnd(mem[i], ~(0xFFFFu << shift));
+	atomicOr(mem[i], (v & 0xFFFFu) << shift);
 }
 
 // Colors (Common/Data/Convert/ColorConv.h).
@@ -282,6 +284,7 @@ void UVFromPlanes32(int qv, int sv, int tv, int expQ, int expS, int expT, out ui
 	uint xb[3];
 	const int vals[3] = int[3](qv, sv, tv);
 	const int exps[3] = int[3](expQ, expS, expT);
+	[[unroll]]
 	for (int i = 0; i < 3; ++i) {
 		if (vals[i] == 0) {
 			xb[i] = 0u;
@@ -310,6 +313,7 @@ void UVFromPlanes32(int qv, int sv, int tv, int expQ, int expS, int expT, out ui
 	const int re = int((rb >> 23) & 0xFFu);
 	// GEUVProduct: the 16-bit significands' product, cut to 24 bits.
 	uint out2[2];
+	[[unroll]]
 	for (int i = 0; i < 2; ++i) {
 		const uint x = xb[i + 1];
 		const int xe = int((x >> 23) & 0xFFu);
@@ -562,7 +566,8 @@ ivec4 SampleTexture(uint st, int level, int levelFrac, bool bilinear, uint sBits
 	bilinear = USE_BILINEAR && bilinear;
 	const int levels = USE_MIPS && levelFrac != 0 ? 2 : 1;
 	const int texels = bilinear ? 4 : 1;
-	ivec4 result[2] = ivec4[2](ivec4(0), ivec4(0));
+	// Locals, not arrays: indexed at run time, those would leave the registers.
+	ivec4 result0 = ivec4(0), result1 = ivec4(0);
 	for (int l = 0; l < levels; ++l) {
 		const int lv = level + l;
 		const ivec2 size = LevelSize(st, lv);
@@ -586,22 +591,27 @@ ivec4 SampleTexture(uint st, int level, int levelFrac, bool bilinear, uint sBits
 			us.x = clampS ? ClampUV(u, size.x) : WrapUV(u, size.x);
 			vs.x = clampT ? ClampUV(v, size.y) : WrapUV(v, size.y);
 		}
-		ivec4 c[4];
+		// Like the GE: horizontal lerps truncated to 8 bits, then the vertical one.
+		ivec4 left = ivec4(0), top = ivec4(0), bot = ivec4(0);
 		[[dont_unroll]]
-		for (int i = 0; i < texels; ++i)
-			c[i] = Unpack(ReadTexel(st, lv, uint((i & 1) != 0 ? us.y : us.x), uint((i & 2) != 0 ? vs.y : vs.x)));
-		if (bilinear) {
-			// Like the GE: horizontal lerps truncated to 8 bits, then the vertical one.
-			const ivec4 top = (c[0] * (16 - fracU) + c[1] * fracU) >> 4;
-			const ivec4 bot = (c[2] * (16 - fracU) + c[3] * fracU) >> 4;
-			result[l] = (top * (16 - fracV) + bot * fracV) >> 4;
-		} else {
-			result[l] = c[0];
+		for (int i = 0; i < texels; ++i) {
+			const ivec4 c = Unpack(ReadTexel(st, lv, uint((i & 1) != 0 ? us.y : us.x), uint((i & 2) != 0 ? vs.y : vs.x)));
+			if ((i & 1) == 0)
+				left = c;
+			else if (i == 1)
+				top = (left * (16 - fracU) + c * fracU) >> 4;
+			else
+				bot = (left * (16 - fracU) + c * fracU) >> 4;
 		}
+		const ivec4 result = bilinear ? (top * (16 - fracV) + bot * fracV) >> 4 : left;
+		if (l == 0)
+			result0 = result;
+		else
+			result1 = result;
 	}
 	if (USE_MIPS && levelFrac != 0)
-		return (result[1] * levelFrac + result[0] * (16 - levelFrac)) >> 4;
-	return result[0];
+		return (result1 * levelFrac + result0 * (16 - levelFrac)) >> 4;
+	return result0;
 }
 
 // GetTextureFunctionOutput.
@@ -676,59 +686,50 @@ uint DepthAddr(uint st, int x, int y) {
 	return stored & 0x001FFFFFu;
 }
 
-// The invocation's pixels while cached: the color as stored (16 or 32 bits) and the depth, for pixel gPix.
-uint gColor[2];
-uint gDepth[2];
-bool gColorDirty[2];
-bool gDepthDirty[2];
-int gPix = 0;
+// The invocation's pixel while cached: the color as stored (16 or 32 bits) and the depth.
+uint gColor;
+uint gDepth;
+bool gColorDirty = false;
+bool gDepthDirty = false;
 
 uint FBRead16(uint addr) {
-	return (pc.cacheFlags & CACHE_COLOR) != 0u ? gColor[gPix] : MemRead16(addr);
+	return (pc.cacheFlags & CACHE_COLOR) != 0u ? gColor : MemRead16(addr);
 }
 
 uint FBRead32(uint addr) {
-	return (pc.cacheFlags & CACHE_COLOR) != 0u ? gColor[gPix] : MemRead32(addr);
+	return (pc.cacheFlags & CACHE_COLOR) != 0u ? gColor : MemRead32(addr);
 }
-
+)",
+R"(
 void FBWrite16(uint addr, uint v) {
 	if ((pc.cacheFlags & CACHE_COLOR) != 0u) {
-		gColor[gPix] = v & 0xFFFFu;
-		gColorDirty[gPix] = true;
+		gColor = v & 0xFFFFu;
+		gColorDirty = true;
 	} else {
 		MemWrite16(addr, v);
 	}
 }
-)",
-R"(
+
 void FBWrite32(uint addr, uint v) {
 	if ((pc.cacheFlags & CACHE_COLOR) != 0u) {
-		gColor[gPix] = v;
-		gColorDirty[gPix] = true;
+		gColor = v;
+		gColorDirty = true;
 	} else {
 		mem[addr >> 2] = v;
 	}
 }
 
 uint DepthRead(uint st, int x, int y) {
-	return (pc.cacheFlags & CACHE_DEPTH) != 0u ? gDepth[gPix] : MemRead16(DepthAddr(st, x, y));
+	return (pc.cacheFlags & CACHE_DEPTH) != 0u ? gDepth : MemRead16(DepthAddr(st, x, y));
 }
 
 void DepthWrite(uint st, int x, int y, uint z) {
 	if ((pc.cacheFlags & CACHE_DEPTH) != 0u) {
-		gDepth[gPix] = z & 0xFFFFu;
-		gDepthDirty[gPix] = true;
+		gDepth = z & 0xFFFFu;
+		gDepthDirty = true;
 	} else {
 		MemWrite16(DepthAddr(st, x, y), z);
 	}
-}
-
-// Writing back a cached 16-bit pixel: the other half of the word can be another invocation's.
-void AtomicWrite16(uint addr, uint v) {
-	const uint i = addr >> 2;
-	const uint shift = (addr & 2u) << 3;
-	atomicAnd(mem[i], ~(0xFFFFu << shift));
-	atomicOr(mem[i], (v & 0xFFFFu) << shift);
 }
 
 bool Compare(int func, int a, int b) {
@@ -1050,10 +1051,10 @@ bool TriangleFragment(uint prim, uint st, int x, int y, out Frag f) {
 	const bool e32 = (flags & PRIMF_EDGES32) != 0u;
 	const bool p32 = (flags & PRIMF_PLANES32) != 0u;
 	const int xc = x * 16 + 8, yc = y * 16 + 8;
-)",
-R"(
+
 	const uint snap = data[d + TRI_SNAP];
 	const int snapEdge = int(snap << 24) >> 24;
+	[[unroll]]
 	for (int k = 0; k < 3; ++k) {
 		if (k != snapEdge && !EdgeInside(d + TRI_EDGES + uint(k) * 4u, e32, xc, yc))
 			return false;
@@ -1068,7 +1069,8 @@ R"(
 		if (!EdgeInside(d + TRI_EDGES + uint(snapEdge) * 4u, e32, at * 16 + 8, yc))
 			return false;
 	}
-
+)",
+R"(
 	uint plane = d + TRI_PLANES;
 	if ((flags & PRIMF_FLATZ) != 0u) {
 		f.z = int(data[d + TRI_Z]);
@@ -1088,6 +1090,7 @@ R"(
 	if ((flags & PRIMF_FLAT_C0) != 0u) {
 		f.color = Unpack(data[d + TRI_C0]);
 	} else {
+		[[unroll]]
 		for (int c = 0; c < 4; ++c) {
 			f.color[c] = clamp(PlaneValue(plane, p32, xc, yc), 0, 255);
 			plane += PLANE_WORDS;
@@ -1096,6 +1099,7 @@ R"(
 	if ((flags & PRIMF_FLAT_C1) != 0u) {
 		f.sec = Unpack(data[d + TRI_C1]).rgb;
 	} else {
+		[[unroll]]
 		for (int c = 0; c < 3; ++c) {
 			f.sec[c] = clamp(PlaneValue(plane, p32, xc, yc), 0, 255);
 			plane += PLANE_WORDS;
@@ -1119,6 +1123,7 @@ R"(
 			const int spanX = x & ~3;
 			int pick = spanX + (rtl ? 2 : 1);
 			if (!TriangleCovers(d + TRI_EDGES, e32, pick, yc)) {
+				[[unroll]]
 				for (int i = 0; i < 4; ++i) {
 					const int px = rtl ? spanX + 3 - i : spanX + i;
 					if (TriangleCovers(d + TRI_EDGES, e32, px, yc)) {
@@ -1321,44 +1326,30 @@ void main() {
 	const uint tileXY = data[tile];
 	const uint itemStart = pc.itemsOffset + data[tile + 1u];
 	const uint itemCount = data[tile + 2u];
-	const int x = int(tileXY & 0xFFFFu) * 16 + int(gl_LocalInvocationID.x) * 2;
+	const int x = int(tileXY & 0xFFFFu) * 16 + int(gl_LocalInvocationID.x);
 	const int y = int(tileXY >> 16) * 16 + int(gl_LocalInvocationID.y);
 
 	const uint cst = pc.cacheState;
 	const bool color32 = ((data[cst + ST_PIXEL0] >> PX0_FBFORMAT_SHIFT) & 3u) == FMT_8888;
-	[[dont_unroll]]
-	for (int p = 0; p < 2; ++p) {
-		gColorDirty[p] = false;
-		gDepthDirty[p] = false;
-		if ((pc.cacheFlags & CACHE_COLOR) != 0u) {
-			const uint addr = FBAddr(cst, x + p, y, color32 ? 4u : 2u);
-			gColor[p] = color32 ? MemRead32(addr) : MemRead16(addr);
-		}
-		if ((pc.cacheFlags & CACHE_DEPTH) != 0u)
-			gDepth[p] = MemRead16(DepthAddr(cst, x + p, y));
+	if ((pc.cacheFlags & CACHE_COLOR) != 0u) {
+		const uint addr = FBAddr(cst, x, y, color32 ? 4u : 2u);
+		gColor = color32 ? MemRead32(addr) : MemRead16(addr);
 	}
+	if ((pc.cacheFlags & CACHE_DEPTH) != 0u)
+		gDepth = MemRead16(DepthAddr(cst, x, y));
 
-	for (uint i = 0u; i < itemCount; ++i) {
-		const uint prim = pc.primsOffset + data[itemStart + i];
-		[[dont_unroll]]
-		for (int p = 0; p < 2; ++p) {
-			gPix = p;
-			DrawPrim(prim, x + p, y);
-		}
-	}
+	for (uint i = 0u; i < itemCount; ++i)
+		DrawPrim(pc.primsOffset + data[itemStart + i], x, y);
 
-	[[dont_unroll]]
-	for (int p = 0; p < 2; ++p) {
-		if (gColorDirty[p]) {
-			const uint addr = FBAddr(cst, x + p, y, color32 ? 4u : 2u);
-			if (color32)
-				mem[addr >> 2] = gColor[p];
-			else
-				AtomicWrite16(addr, gColor[p]);
-		}
-		if (gDepthDirty[p])
-			AtomicWrite16(DepthAddr(cst, x + p, y), gDepth[p]);
+	if (gColorDirty) {
+		const uint addr = FBAddr(cst, x, y, color32 ? 4u : 2u);
+		if (color32)
+			mem[addr >> 2] = gColor;
+		else
+			MemWrite16(addr, gColor);
 	}
+	if (gDepthDirty)
+		MemWrite16(DepthAddr(cst, x, y), gDepth);
 }
 
 )",
