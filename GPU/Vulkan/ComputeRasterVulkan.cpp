@@ -51,8 +51,8 @@ namespace SoftCompute {
 
 // The GPU's copy of memory is tracked in pages: uploaded when the CPU changed one the drawing reads, and copied
 // back when the GPU drew to one.
-static constexpr uint32_t PAGE_SHIFT = 12;
-static constexpr uint32_t PAGE_SIZE = 1 << PAGE_SHIFT;
+static constexpr uint32_t MIRROR_PAGE_SHIFT = 12;
+static constexpr uint32_t MIRROR_PAGE_SIZE = 1 << MIRROR_PAGE_SHIFT;
 // Self-texturing snapshots, and data from the CPU (CLUTs, textures that aren't in PSP memory).
 static constexpr uint32_t SNAPSHOT_SIZE = 4 * 1024 * 1024;
 static constexpr uint32_t SCRATCH_SIZE = 8 * 1024 * 1024;
@@ -447,8 +447,8 @@ bool ComputeRasterVulkan::Init() {
 	}
 
 	shadow_.assign(ramOffset_ + ramSize_, 0);
-	verified_.assign(((ramOffset_ + ramSize_) >> PAGE_SHIFT) / 32 + 1, 0);
-	gpuDirty_.assign((MEM_VRAM_SIZE >> PAGE_SHIFT) / 32, 0);
+	verified_.assign(((ramOffset_ + ramSize_) >> MIRROR_PAGE_SHIFT) / 32 + 1, 0);
+	gpuDirty_.assign((MEM_VRAM_SIZE >> MIRROR_PAGE_SHIFT) / 32, 0);
 	tileCount_.assign(TILES_X * TILES_Y, 0);
 	tilePos_.assign(TILES_X * TILES_Y, 0);
 	// Enough for a busy frame.
@@ -567,7 +567,7 @@ uint8_t *ComputeRasterVulkan::AllocStaging(size_t bytes, VkBuffer *buffer, VkDev
 }
 
 const uint8_t *ComputeRasterVulkan::PageSource(uint32_t page) const {
-	const uint32_t offset = page << PAGE_SHIFT;
+	const uint32_t offset = page << MIRROR_PAGE_SHIFT;
 	if (offset < MEM_VRAM_SIZE)
 		return Memory::GetPointerUnchecked(0x04000000) + offset;
 	return Memory::GetPointerUnchecked(0x08000000) + (offset - ramOffset_);
@@ -594,9 +594,9 @@ void ComputeRasterVulkan::AddUpload(uint32_t memOffset, const void *src, uint32_
 void ComputeRasterVulkan::VerifyPages(uint32_t memOffset, uint32_t bytes) {
 	if (bytes == 0)
 		return;
-	const uint32_t first = memOffset >> PAGE_SHIFT;
-	const uint32_t last = std::min((uint32_t)(memOffset + bytes - 1), (uint32_t)(ramOffset_ + ramSize_ - 1)) >> PAGE_SHIFT;
-	const uint32_t vramPages = MEM_VRAM_SIZE >> PAGE_SHIFT;
+	const uint32_t first = memOffset >> MIRROR_PAGE_SHIFT;
+	const uint32_t last = std::min((uint32_t)(memOffset + bytes - 1), (uint32_t)(ramOffset_ + ramSize_ - 1)) >> MIRROR_PAGE_SHIFT;
+	const uint32_t vramPages = MEM_VRAM_SIZE >> MIRROR_PAGE_SHIFT;
 	for (uint32_t page = first; page <= last; ++page) {
 		uint32_t &word = verified_[page >> 5];
 		const uint32_t bit = 1U << (page & 31);
@@ -605,13 +605,13 @@ void ComputeRasterVulkan::VerifyPages(uint32_t memOffset, uint32_t bytes) {
 		word |= bit;
 		if (page < vramPages && (gpuDirty_[page >> 5] & bit))
 			continue;
-		if (page >= vramPages && (page << PAGE_SHIFT) - ramOffset_ >= Memory::g_MemorySize)
+		if (page >= vramPages && (page << MIRROR_PAGE_SHIFT) - ramOffset_ >= Memory::g_MemorySize)
 			continue;
 		const uint8_t *src = PageSource(page);
-		uint8_t *shadow = &shadow_[page << PAGE_SHIFT];
-		if (memcmp(src, shadow, PAGE_SIZE) != 0) {
-			memcpy(shadow, src, PAGE_SIZE);
-			AddUpload(page << PAGE_SHIFT, src, PAGE_SIZE);
+		uint8_t *shadow = &shadow_[page << MIRROR_PAGE_SHIFT];
+		if (memcmp(src, shadow, MIRROR_PAGE_SIZE) != 0) {
+			memcpy(shadow, src, MIRROR_PAGE_SIZE);
+			AddUpload(page << MIRROR_PAGE_SHIFT, src, MIRROR_PAGE_SIZE);
 		}
 	}
 }
@@ -636,9 +636,9 @@ void ComputeRasterVulkan::MarkGPUWrite(uint32_t vramOffset, uint32_t bytes) {
 	if (vramOffset >= lastMarked_.start && vramOffset + bytes <= lastMarked_.end && lastMarked_.gen == verifyGen_)
 		return;
 	lastMarked_ = { vramOffset, vramOffset + bytes, verifyGen_ };
-	const uint32_t first = vramOffset >> PAGE_SHIFT;
-	const uint32_t count = ((vramOffset + bytes - 1) >> PAGE_SHIFT) - first + 1;
-	const uint32_t vramPages = MEM_VRAM_SIZE >> PAGE_SHIFT;
+	const uint32_t first = vramOffset >> MIRROR_PAGE_SHIFT;
+	const uint32_t count = ((vramOffset + bytes - 1) >> MIRROR_PAGE_SHIFT) - first + 1;
+	const uint32_t vramPages = MEM_VRAM_SIZE >> MIRROR_PAGE_SHIFT;
 	for (uint32_t i = 0; i < count; ++i) {
 		const uint32_t page = (first + i) % vramPages;
 		gpuDirty_[page >> 5] |= 1U << (page & 31);
@@ -1285,9 +1285,9 @@ bool ComputeRasterVulkan::HasGPUWrites(uint32_t addr, uint32_t bytes) const {
 		return false;
 	bytes = std::min(bytes, MEM_VRAM_SIZE);
 	const uint32_t offset = addr & (MEM_VRAM_SIZE - 1);
-	const uint32_t first = offset >> PAGE_SHIFT;
-	const uint32_t count = ((offset + bytes - 1) >> PAGE_SHIFT) - first + 1;
-	const uint32_t vramPages = MEM_VRAM_SIZE >> PAGE_SHIFT;
+	const uint32_t first = offset >> MIRROR_PAGE_SHIFT;
+	const uint32_t count = ((offset + bytes - 1) >> MIRROR_PAGE_SHIFT) - first + 1;
+	const uint32_t vramPages = MEM_VRAM_SIZE >> MIRROR_PAGE_SHIFT;
 	for (uint32_t i = 0; i < count; ++i) {
 		const uint32_t page = (first + i) % vramPages;
 		if (gpuDirty_[page >> 5] & (1U << (page & 31)))
@@ -1309,15 +1309,15 @@ void ComputeRasterVulkan::Flush(bool readback) {
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
 		std::vector<VkBufferCopy> copies;
-		const uint32_t vramPages = MEM_VRAM_SIZE >> PAGE_SHIFT;
+		const uint32_t vramPages = MEM_VRAM_SIZE >> MIRROR_PAGE_SHIFT;
 		for (uint32_t page = 0; page < vramPages; ++page) {
 			if (!(gpuDirty_[page >> 5] & (1U << (page & 31))))
 				continue;
-			const VkDeviceSize offset = (VkDeviceSize)page << PAGE_SHIFT;
+			const VkDeviceSize offset = (VkDeviceSize)page << MIRROR_PAGE_SHIFT;
 			if (!copies.empty() && copies.back().srcOffset + copies.back().size == offset)
-				copies.back().size += PAGE_SIZE;
+				copies.back().size += MIRROR_PAGE_SIZE;
 			else
-				copies.push_back(VkBufferCopy{ offset, offset, PAGE_SIZE });
+				copies.push_back(VkBufferCopy{ offset, offset, MIRROR_PAGE_SIZE });
 		}
 		vkCmdCopyBuffer(cmd, mem_.buffer, readback_.buffer, (uint32_t)copies.size(), copies.data());
 		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
