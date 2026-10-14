@@ -67,6 +67,13 @@ struct PushParams {
 	uint32_t tilesOffset;
 	uint32_t itemsOffset;
 	uint32_t memBytes;
+	uint32_t cacheFlags;
+	uint32_t cacheState;
+};
+
+enum : uint32_t {
+	CACHE_COLOR = 1,
+	CACHE_DEPTH = 2,
 };
 
 static void AddDefine(std::string &s, const char *name, uint32_t value) {
@@ -160,6 +167,9 @@ private:
 		uint32_t end;
 		uint32_t tileFirst;
 		uint32_t tileCount;
+		// How the shader can keep pixels in registers (CacheFlags), with the state that has the buffers.
+		uint32_t cacheFlags;
+		uint32_t cacheState;
 		// COPY: within the memory buffer.
 		uint32_t src;
 		uint32_t dst;
@@ -178,6 +188,7 @@ private:
 	uint8_t *AllocStaging(size_t bytes, VkBuffer *buffer, VkDeviceSize *offset);
 
 	void Submit();
+	void SegmentCaching(Op &op);
 	void ResetBatch();
 	template <typename F>
 	void ForPrimTiles(uint32_t off, F f);
@@ -862,6 +873,72 @@ void ComputeRasterVulkan::ForPrimTiles(uint32_t off, F f) {
 }
 
 // Records the batch for the GPU (it runs with the frame's init commands, or at the next sync).
+// Whether the shader can keep a segment's pixels in registers until it's done: every primitive draws to the same
+// color (and depth) buffer, no pixel is another's (a primitive reaching past the stride wraps into the next
+// row), and the color and depth don't overlap.
+void ComputeRasterVulkan::SegmentCaching(Op &op) {
+	op.cacheFlags = 0;
+	op.cacheState = 0;
+	if (op.first == op.end)
+		return;
+	const uint32_t *color = nullptr;
+	const uint32_t *depth = nullptr;
+	uint32_t colorState = 0;
+	bool colorOK = true, depthOK = true;
+	uint32_t x2 = 0, y1 = 0xFFFF, y2 = 0;
+	for (uint32_t i = op.first; i < op.end; ++i) {
+		const uint32_t off = primOffsets_[i];
+		const uint32_t index = prims_[off + PRIM_STATE];
+		const uint32_t *st = &states_[index * ST_WORDS];
+		const uint32_t px0 = st[ST_PIXEL0];
+		if (!color) {
+			color = st;
+			colorState = index;
+		} else if (st[ST_FB_ADDR] != color[ST_FB_ADDR] || (st[ST_STRIDES] & 0xFFFF) != (color[ST_STRIDES] & 0xFFFF) || ((px0 ^ color[ST_PIXEL0]) & (3 << PX0_FBFORMAT_SHIFT)) != 0) {
+			colorOK = false;
+		}
+		const bool usesDepth = (px0 & PX0_DEPTHWRITE) != 0 || ((px0 >> PX0_DEPTHTEST_SHIFT) & 7) != GE_COMP_ALWAYS;
+		if (usesDepth) {
+			if (!depth)
+				depth = st;
+			else if (st[ST_Z_BASE] != depth[ST_Z_BASE] || (st[ST_STRIDES] >> 16) != (depth[ST_STRIDES] >> 16) || st[ST_Z_ROTMASK] != depth[ST_Z_ROTMASK] || st[ST_Z_ROTSHIFT] != depth[ST_Z_ROTSHIFT] || st[ST_Z_XOR] != depth[ST_Z_XOR])
+				depthOK = false;
+		}
+		const uint32_t xy1 = prims_[off + PRIM_XY1], xy2 = prims_[off + PRIM_XY2];
+		x2 = std::max(x2, xy2 & 0xFFFF);
+		y1 = std::min(y1, xy1 >> 16);
+		y2 = std::max(y2, xy2 >> 16);
+	}
+	if (!colorOK)
+		return;
+
+	const uint32_t fbStride = color[ST_STRIDES] & 0xFFFF;
+	const uint32_t bpp = ((color[ST_PIXEL0] >> PX0_FBFORMAT_SHIFT) & 3) == GE_FORMAT_8888 ? 4 : 2;
+	const uint32_t colorStart = color[ST_FB_ADDR] + y1 * fbStride * bpp;
+	const uint32_t colorEnd = color[ST_FB_ADDR] + (y2 * fbStride + x2 + 1) * bpp;
+	if (x2 >= fbStride || colorEnd > MEM_VRAM_SIZE)
+		return;
+	if (!depth) {
+		op.cacheFlags = CACHE_COLOR;
+		op.cacheState = colorState;
+		return;
+	}
+
+	// The depth swizzle stays within its blocks (as CommitPrim counts them).
+	const uint32_t zStride = depth[ST_STRIDES] >> 16;
+	const uint32_t zStart = (depth[ST_Z_BASE] + y1 * zStride * 2) & ~(DEPTH_BLOCK - 1);
+	const uint32_t zEnd = (depth[ST_Z_BASE] + (y2 * zStride + x2 + 1) * 2 + DEPTH_BLOCK - 1) & ~(DEPTH_BLOCK - 1);
+	// Depth drawn over the color: neither can wait in registers.
+	if (zStart < colorEnd && colorStart < zEnd)
+		return;
+	op.cacheFlags = CACHE_COLOR;
+	op.cacheState = colorState;
+	// The shader takes the depth layout from the same state as the color's.
+	const bool sameLayout = depth[ST_Z_BASE] == color[ST_Z_BASE] && (depth[ST_STRIDES] >> 16) == (color[ST_STRIDES] >> 16) && depth[ST_Z_ROTMASK] == color[ST_Z_ROTMASK] && depth[ST_Z_ROTSHIFT] == color[ST_Z_ROTSHIFT] && depth[ST_Z_XOR] == color[ST_Z_XOR];
+	if (depthOK && sameLayout && x2 < zStride && zEnd <= MEM_VRAM_SIZE)
+		op.cacheFlags |= CACHE_DEPTH;
+}
+
 void ComputeRasterVulkan::Submit() {
 	EndSegment();
 	if (ops_.empty() && uploads_.empty()) {
@@ -899,6 +976,7 @@ void ComputeRasterVulkan::Submit() {
 		items.resize(pos);
 		for (uint64_t tp : tilePrims_)
 			items[tilePos_[tp & 0xFFFF]++] = (uint32_t)(tp >> 16);
+		SegmentCaching(op);
 		statSegments_++;
 	}
 
@@ -976,7 +1054,7 @@ void ComputeRasterVulkan::Submit() {
 		if (op.type == Op::Type::SEGMENT) {
 			if (op.tileCount == 0)
 				continue;
-			PushParams params{ statesOffset, primsOffset, tilesOffset + op.tileFirst * 3, itemsOffset, memBytes_ };
+			PushParams params{ statesOffset, primsOffset, tilesOffset + op.tileFirst * 3, itemsOffset, memBytes_, op.cacheFlags, statesOffset + op.cacheState * ST_WORDS };
 			vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), &params);
 			vkCmdDispatch(cmd, op.tileCount, 1, 1);
 			// The next segment, or copy, sees what it drew.

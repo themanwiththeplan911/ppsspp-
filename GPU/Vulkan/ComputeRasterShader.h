@@ -43,7 +43,15 @@ layout(push_constant) uniform Params {
 	uint tilesOffset;
 	uint itemsOffset;
 	uint memBytes;
+	// CACHE_COLOR, CACHE_DEPTH: the segment's primitives all draw to one buffer, without aliasing, so each
+	// invocation keeps its pixels in registers (gColor, gDepth) and writes them back at the end. cacheState
+	// is a state with the buffers' layout.
+	uint cacheFlags;
+	uint cacheState;
 } pc;
+
+const uint CACHE_COLOR = 1u;
+const uint CACHE_DEPTH = 2u;
 
 const int COMP_NEVER = 0;
 const int COMP_ALWAYS = 1;
@@ -644,6 +652,60 @@ uint DepthAddr(uint st, int x, int y) {
 	return stored & 0x001FFFFFu;
 }
 
+// The invocation's pixels while cached: the color as stored (16 or 32 bits) and the depth, for pixel gPix.
+uint gColor[2];
+uint gDepth[2];
+bool gColorDirty[2];
+bool gDepthDirty[2];
+int gPix = 0;
+
+uint FBRead16(uint addr) {
+	return (pc.cacheFlags & CACHE_COLOR) != 0u ? gColor[gPix] : MemRead16(addr);
+}
+
+uint FBRead32(uint addr) {
+	return (pc.cacheFlags & CACHE_COLOR) != 0u ? gColor[gPix] : MemRead32(addr);
+}
+
+void FBWrite16(uint addr, uint v) {
+	if ((pc.cacheFlags & CACHE_COLOR) != 0u) {
+		gColor[gPix] = v & 0xFFFFu;
+		gColorDirty[gPix] = true;
+	} else {
+		MemWrite16(addr, v);
+	}
+}
+
+void FBWrite32(uint addr, uint v) {
+	if ((pc.cacheFlags & CACHE_COLOR) != 0u) {
+		gColor[gPix] = v;
+		gColorDirty[gPix] = true;
+	} else {
+		mem[addr >> 2] = v;
+	}
+}
+
+uint DepthRead(uint st, int x, int y) {
+	return (pc.cacheFlags & CACHE_DEPTH) != 0u ? gDepth[gPix] : MemRead16(DepthAddr(st, x, y));
+}
+
+void DepthWrite(uint st, int x, int y, uint z) {
+	if ((pc.cacheFlags & CACHE_DEPTH) != 0u) {
+		gDepth[gPix] = z & 0xFFFFu;
+		gDepthDirty[gPix] = true;
+	} else {
+		MemWrite16(DepthAddr(st, x, y), z);
+	}
+}
+
+// Writing back a cached 16-bit pixel: the other half of the word can be another invocation's.
+void AtomicWrite16(uint addr, uint v) {
+	const uint i = addr >> 2;
+	const uint shift = (addr & 2u) << 3;
+	atomicAnd(mem[i], ~(0xFFFFu << shift));
+	atomicOr(mem[i], (v & 0xFFFFu) << shift);
+}
+
 bool Compare(int func, int a, int b) {
 	switch (func) {
 	case COMP_NEVER: return false;
@@ -658,7 +720,7 @@ bool Compare(int func, int a, int b) {
 }
 
 bool DepthTestPassed(uint st, int func, int x, int y, int z) {
-	return Compare(func, z, int(MemRead16(DepthAddr(st, x, y))));
+	return Compare(func, z, int(DepthRead(st, x, y)));
 }
 
 // The depth range and depth tests some primitives do before texturing (earlyZChecks).
@@ -673,10 +735,10 @@ bool EarlyZPassed(uint st, int x, int y, int z) {
 
 uint ReadColor(uint fmt, uint addr) {
 	switch (fmt) {
-	case FMT_565: return RGB565ToRGBA8888(MemRead16(addr)) & 0x00FFFFFFu;
-	case FMT_5551: return RGBA5551ToRGBA8888(MemRead16(addr));
-	case FMT_4444: return RGBA4444ToRGBA8888(MemRead16(addr));
-	default: return MemRead32(addr);
+	case FMT_565: return RGB565ToRGBA8888(FBRead16(addr)) & 0x00FFFFFFu;
+	case FMT_5551: return RGBA5551ToRGBA8888(FBRead16(addr));
+	case FMT_4444: return RGBA4444ToRGBA8888(FBRead16(addr));
+	default: return FBRead32(addr);
 	}
 }
 
@@ -686,35 +748,36 @@ void WriteColor(uint fmt, uint addr, uint value, uint oldValue, uint writeMask) 
 		value = RGBA8888ToRGB565(value);
 		if (writeMask != 0u)
 			value = (value & ~writeMask) | (RGBA8888ToRGB565(oldValue) & writeMask);
-		MemWrite16(addr, value);
+		FBWrite16(addr, value);
 		break;
 	case FMT_5551:
 		value = RGBA8888ToRGBA5551(value);
 		if (writeMask != 0u)
 			value = (value & ~writeMask) | (RGBA8888ToRGBA5551(oldValue) & writeMask);
-		MemWrite16(addr, value);
+		FBWrite16(addr, value);
 		break;
 	case FMT_4444:
 		value = RGBA8888ToRGBA4444(value);
 		if (writeMask != 0u)
 			value = (value & ~writeMask) | (RGBA8888ToRGBA4444(oldValue) & writeMask);
-		MemWrite16(addr, value);
+		FBWrite16(addr, value);
 		break;
 	default:
-		mem[addr >> 2] = (value & ~writeMask) | (oldValue & writeMask);
+		FBWrite32(addr, (value & ~writeMask) | (oldValue & writeMask));
 		break;
 	}
 }
-
+)",
+R"(
 uint ReadStencil(uint fmt, uint addr) {
 	switch (fmt) {
 	case FMT_565: return 0u;
-	case FMT_5551: return (MemRead16(addr) & 0x8000u) != 0u ? 0xFFu : 0u;
+	case FMT_5551: return (FBRead16(addr) & 0x8000u) != 0u ? 0xFFu : 0u;
 	case FMT_4444: {
-		const uint v = MemRead16(addr) >> 12;
+		const uint v = FBRead16(addr) >> 12;
 		return (v << 4) | v;
 	}
-	default: return MemRead32(addr) >> 24;
+	default: return FBRead32(addr) >> 24;
 	}
 }
 
@@ -723,13 +786,13 @@ void WriteStencil(uint fmt, uint addr, uint writeMask, uint value) {
 		return;
 	if (fmt == FMT_5551) {
 		if ((writeMask & 0x8000u) == 0u)
-			MemWrite16(addr, (MemRead16(addr) & ~0x8000u) | ((value & 0x80u) << 8));
+			FBWrite16(addr, (FBRead16(addr) & ~0x8000u) | ((value & 0x80u) << 8));
 	} else if (fmt == FMT_4444) {
 		const uint mask = writeMask | 0x0FFFu;
-		MemWrite16(addr, (MemRead16(addr) & mask) | ((value << 8) & ~mask & 0xFFFFu));
+		FBWrite16(addr, (FBRead16(addr) & mask) | ((value << 8) & ~mask & 0xFFFFu));
 	} else {
 		const uint mask = writeMask | 0x00FFFFFFu;
-		mem[addr >> 2] = (mem[addr >> 2] & mask) | ((value << 24) & ~mask);
+		FBWrite32(addr, (FBRead32(addr) & mask) | ((value << 24) & ~mask));
 	}
 }
 
@@ -756,8 +819,7 @@ uint StencilOp(uint fmt, uint replace, uint op, uint old) {
 	default: return old;
 	}
 }
-)",
-R"(
+
 uint LogicOp(uint op, uint oldColor, uint newColor) {
 	switch (op) {
 	case 0u: return newColor & 0xFF000000u;
@@ -876,12 +938,12 @@ void DrawPixel(uint st, int x, int y, int z, int fog, ivec4 color) {
 
 	const uint writeMask = (px0 & PX0_WRITEMASK) != 0u ? data[st + ST_WRITEMASK] : 0u;
 	const uint bpp = fmt == FMT_8888 ? 4u : 2u;
-	const uint fbAddr = FBAddr(st, x, y, bpp);
+	const uint fbAddr = (pc.cacheFlags & CACHE_COLOR) != 0u ? 0u : FBAddr(st, x, y, bpp);
 	const int depthFunc = int((px0 >> PX0_DEPTHTEST_SHIFT) & 7u);
 	uint stencil = clearMode ? uint(color.a) : ReadStencil(fmt, fbAddr);
 	if (clearMode) {
 		if ((px0 & PX0_DEPTHWRITE) != 0u)
-			MemWrite16(DepthAddr(st, x, y), uint(z));
+			DepthWrite(st, x, y, uint(z));
 	} else if ((px0 & PX0_STENCILTEST) != 0u) {
 		const uint stencilReplace = (px0 & PX0_STENCILTESTMASK) != 0u ? (data[st + ST_MISC] & 0xFFu) : ((refs >> 8) & 0xFFu);
 		uint testStencil = stencil;
@@ -905,7 +967,7 @@ void DrawPixel(uint st, int x, int y, int z, int fog, ivec4 color) {
 	}
 
 	if ((px0 & PX0_DEPTHWRITE) != 0u && !clearMode)
-		MemWrite16(DepthAddr(st, x, y), uint(z));
+		DepthWrite(st, x, y, uint(z));
 
 	const uint oldColor = ReadColor(fmt, fbAddr);
 	uint newColor;
@@ -1054,7 +1116,8 @@ bool TriangleFragment(uint prim, uint st, int x, int y, out Frag f) {
 	}
 	return true;
 }
-
+)",
+R"(
 bool RectFragment(uint prim, uint st, int x, int y, out Frag f) {
 	const uint flags = data[prim + PRIM_TYPE_FLAGS];
 	const uint d = prim + PRIM_HEADER_WORDS;
@@ -1083,8 +1146,7 @@ bool RectFragment(uint prim, uint st, int x, int y, out Frag f) {
 	}
 	return true;
 }
-)",
-R"(
+
 bool SpriteFragment(uint prim, uint st, int x, int y, out Frag f) {
 	const uint flags = data[prim + PRIM_TYPE_FLAGS];
 	const uint d = prim + PRIM_HEADER_WORDS;
@@ -1144,7 +1206,7 @@ void DrawClearRect(uint prim, uint st, int x, int y) {
 	const uint px0 = data[st + ST_PIXEL0];
 	const uint fmt = (px0 >> PX0_FBFORMAT_SHIFT) & 3u;
 	if ((px0 & PX0_DEPTHWRITE) != 0u)
-		MemWrite16(DepthAddr(st, x, y), data[d + CLEAR_Z]);
+		DepthWrite(st, x, y, data[d + CLEAR_Z]);
 
 	// ClearRectangle's mask of what to keep.
 	const bool colorClear = (px0 & PX0_COLORTEST) != 0u;
@@ -1178,8 +1240,8 @@ void DrawClearRect(uint prim, uint st, int x, int y) {
 
 	const uint newColor = data[d + CLEAR_COLOR];
 	if (fmt == FMT_8888) {
-		const uint addr = FBAddr(st, x, y, 4u);
-		mem[addr >> 2] = (mem[addr >> 2] & keepOldMask) | (newColor & ~keepOldMask);
+		const uint addr = (pc.cacheFlags & CACHE_COLOR) != 0u ? 0u : FBAddr(st, x, y, 4u);
+		FBWrite32(addr, (FBRead32(addr) & keepOldMask) | (newColor & ~keepOldMask));
 	} else {
 		uint newColor16;
 		if (fmt == FMT_565)
@@ -1188,8 +1250,8 @@ void DrawClearRect(uint prim, uint st, int x, int y) {
 			newColor16 = RGBA8888ToRGBA5551(newColor);
 		else
 			newColor16 = RGBA8888ToRGBA4444(newColor);
-		const uint addr = FBAddr(st, x, y, 2u);
-		MemWrite16(addr, (MemRead16(addr) & keepOldMask) | (newColor16 & ~keepOldMask));
+		const uint addr = (pc.cacheFlags & CACHE_COLOR) != 0u ? 0u : FBAddr(st, x, y, 2u);
+		FBWrite16(addr, (FBRead16(addr) & keepOldMask) | (newColor16 & ~keepOldMask));
 	}
 }
 
@@ -1235,11 +1297,41 @@ void main() {
 	const uint itemCount = data[tile + 2u];
 	const int x = int(tileXY & 0xFFFFu) * 16 + int(gl_LocalInvocationID.x) * 2;
 	const int y = int(tileXY >> 16) * 16 + int(gl_LocalInvocationID.y);
+
+	const uint cst = pc.cacheState;
+	const bool color32 = ((data[cst + ST_PIXEL0] >> PX0_FBFORMAT_SHIFT) & 3u) == FMT_8888;
+	[[dont_unroll]]
+	for (int p = 0; p < 2; ++p) {
+		gColorDirty[p] = false;
+		gDepthDirty[p] = false;
+		if ((pc.cacheFlags & CACHE_COLOR) != 0u) {
+			const uint addr = FBAddr(cst, x + p, y, color32 ? 4u : 2u);
+			gColor[p] = color32 ? MemRead32(addr) : MemRead16(addr);
+		}
+		if ((pc.cacheFlags & CACHE_DEPTH) != 0u)
+			gDepth[p] = MemRead16(DepthAddr(cst, x + p, y));
+	}
+
 	for (uint i = 0u; i < itemCount; ++i) {
 		const uint prim = pc.primsOffset + data[itemStart + i];
 		[[dont_unroll]]
-		for (int p = 0; p < 2; ++p)
+		for (int p = 0; p < 2; ++p) {
+			gPix = p;
 			DrawPrim(prim, x + p, y);
+		}
+	}
+
+	[[dont_unroll]]
+	for (int p = 0; p < 2; ++p) {
+		if (gColorDirty[p]) {
+			const uint addr = FBAddr(cst, x + p, y, color32 ? 4u : 2u);
+			if (color32)
+				mem[addr >> 2] = gColor[p];
+			else
+				AtomicWrite16(addr, gColor[p]);
+		}
+		if (gDepthDirty[p])
+			AtomicWrite16(DepthAddr(cst, x + p, y), gDepth[p]);
 	}
 }
 
