@@ -1030,10 +1030,7 @@ void ComputeRasterVulkan::ForPrimTiles(uint32_t off, F f) {
 	}
 }
 
-// Records the batch for the GPU (it runs with the frame's init commands, or at the next sync).
-// What a segment's primitives use (the shader variant), and whether the shader can keep its pixels in registers
-// until it's done: every primitive draws to the same color (and depth) buffer, no pixel is another's (a primitive
-// reaching past the stride wraps into the next row), and the color and depth don't overlap.
+// What a primitive and its state use, as Spec bits.
 uint32_t ComputeRasterVulkan::PrimFeatures(uint32_t off, const uint32_t *st) const {
 	uint32_t f = 0;
 	auto use = [&](Spec s) {
@@ -1162,6 +1159,9 @@ void ComputeRasterVulkan::CompileThread() {
 	}
 }
 
+// What a segment's primitives use (the shader variant), and whether the shader can keep its pixels in registers
+// until it's done: every primitive draws to the same color (and depth) buffer, no pixel is another's (a primitive
+// reaching past the stride wraps into the next row), and the color and depth don't overlap.
 void ComputeRasterVulkan::SegmentSetup(Op &op) {
 	op.cacheFlags = 0;
 	op.cacheState = 0;
@@ -1228,6 +1228,7 @@ void ComputeRasterVulkan::SegmentSetup(Op &op) {
 		op.cacheFlags |= CACHE_DEPTH;
 }
 
+// Records the batch for the GPU (it runs with the frame's init commands, or at the next sync).
 void ComputeRasterVulkan::Submit() {
 	EndSegment();
 	if (ops_.empty() && uploads_.empty()) {
