@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstring>
 
 #include "Common/Common.h"
 #include "Common/CPUDetect.h"
@@ -33,6 +34,7 @@
 
 #include "GPU/Common/TextureDecoder.h"
 #include "GPU/Software/BinManager.h"
+#include "GPU/Software/ComputeRaster.h"
 #include "GPU/Software/DrawPixel.h"
 #include "GPU/Software/GEMath.h"
 #include "GPU/Software/Rasterizer.h"
@@ -114,6 +116,9 @@ static inline Vec4<float> Interpolate(const float &c0, const float &c1, const fl
 }
 
 void ComputeRasterizerState(RasterizerState *state, BinManager *binner) {
+	// The compute backend doesn't draw with the JIT, so don't flush it to compile (null doesn't).
+	if (binner && binner->ComputeActive())
+		binner = nullptr;
 	ComputePixelFuncID(&state->pixelID);
 	state->drawPixel = Rasterizer::GetSingleFunc(state->pixelID, binner);
 	state->drawSpan = Rasterizer::GetSpanFunc(state->pixelID, state->drawPixel);
@@ -1006,22 +1011,34 @@ struct DepthPlane {
 	}
 };
 
-static DepthPlane ComputePlane(const int64_t X[3], const int64_t Y[3], const int64_t Z[3]) {
-	DepthPlane plane{};
-	const int64_t det = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
-	if (det == 0) {
-		plane.base = Z[0] << 14;
-		return plane;
-	}
-	const int64_t nx = (Z[1] - Z[0]) * (Y[2] - Y[0]) - (Z[2] - Z[0]) * (Y[1] - Y[0]);
-	const int64_t ny = (Z[2] - Z[0]) * (X[1] - X[0]) - (Z[1] - Z[0]) * (X[2] - X[0]);
-	const uint64_t absDet = (uint64_t)(det < 0 ? -det : det);
+// The part of a plane that depends only on the positions. Every plane of a triangle (depth, color,
+// fog, UV) shares it, so the last one is kept per thread.
+struct PlaneSetup {
+	int64_t X[3], Y[3];
+	int64_t q;
 	int e;
-	const int64_t q = GESetupRecip(absDet, &e);
-	const int64_t sign = det < 0 ? -1 : 1;
-	// n / det * 2^14, as floor(n * q / 2^(e + 2)).
-	plane.kx = (sign * nx * q) >> (e + 2);
-	plane.ky = (sign * ny * q) >> (e + 2);
+	int64_t sign;
+	int anchor;
+	bool degenerate;
+	bool rightAnchored;
+};
+
+static const PlaneSetup &GetPlaneSetup(const int64_t X[3], const int64_t Y[3]) {
+	static thread_local PlaneSetup last{ { 0, 0, 0 }, { 0, 0, 0 }, 0, 0, 0, 0, true, false };
+	if (memcmp(last.X, X, sizeof(last.X)) == 0 && memcmp(last.Y, Y, sizeof(last.Y)) == 0)
+		return last;
+	PlaneSetup &s = last;
+	memcpy(s.X, X, sizeof(s.X));
+	memcpy(s.Y, Y, sizeof(s.Y));
+	const int64_t det = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+	s.degenerate = det == 0;
+	s.rightAnchored = false;
+	s.anchor = 0;
+	if (s.degenerate)
+		return s;
+	const uint64_t absDet = (uint64_t)(det < 0 ? -det : det);
+	s.q = GESetupRecip(absDet, &s.e);
+	s.sign = det < 0 ? -1 : 1;
 
 	int top = 0, mid = 1, bot = 2;
 	auto above = [&](int a, int b) { return Y[a] < Y[b] || (Y[a] == Y[b] && X[a] < X[b]); };
@@ -1032,7 +1049,7 @@ static DepthPlane ComputePlane(const int64_t X[3], const int64_t Y[3], const int
 	const bool flat = Y[top] == Y[mid] || Y[mid] == Y[bot];
 	int anchor = 0;
 	if (cross > 0 && !flat) {
-		plane.rightAnchored = true;
+		s.rightAnchored = true;
 		for (int i = 1; i < 3; ++i)
 			if (X[i] > X[anchor] || (X[i] == X[anchor] && Y[i] < Y[anchor]))
 				anchor = i;
@@ -1041,6 +1058,24 @@ static DepthPlane ComputePlane(const int64_t X[3], const int64_t Y[3], const int
 			if (X[i] < X[anchor] || (X[i] == X[anchor] && Y[i] < Y[anchor]))
 				anchor = i;
 	}
+	s.anchor = anchor;
+	return s;
+}
+
+static DepthPlane ComputePlane(const int64_t X[3], const int64_t Y[3], const int64_t Z[3]) {
+	DepthPlane plane{};
+	const PlaneSetup &s = GetPlaneSetup(X, Y);
+	if (s.degenerate) {
+		plane.base = Z[0] << 14;
+		return plane;
+	}
+	const int64_t nx = (Z[1] - Z[0]) * (Y[2] - Y[0]) - (Z[2] - Z[0]) * (Y[1] - Y[0]);
+	const int64_t ny = (Z[2] - Z[0]) * (X[1] - X[0]) - (Z[1] - Z[0]) * (X[2] - X[0]);
+	// n / det * 2^14, as floor(n * q / 2^(e + 2)).
+	plane.kx = (s.sign * nx * s.q) >> (s.e + 2);
+	plane.ky = (s.sign * ny * s.q) >> (s.e + 2);
+	plane.rightAnchored = s.rightAnchored;
+	const int anchor = s.anchor;
 	plane.base = (Z[anchor] << 14) - plane.kx * X[anchor] - plane.ky * Y[anchor];
 	return plane;
 }
@@ -1077,17 +1112,41 @@ struct UVPlanes {
 	bool valid;
 };
 
+// std::ilogb and std::ldexp, without the library calls for the normal doubles they mostly get.
+static inline int DoubleExponentBits(double v) {
+	uint64_t bits;
+	memcpy(&bits, &v, sizeof(bits));
+	return (int)((bits >> 52) & 0x7FF);
+}
+
+static inline int FastIlogb(double v) {
+	const int e = DoubleExponentBits(v);
+	return e == 0 || e == 0x7FF ? std::ilogb(v) : e - 1023;
+}
+
+static inline double FastLdexp(double v, int shift) {
+	const int e = DoubleExponentBits(v);
+	// Zero, or a normal result: then the product with the power of two is exact.
+	const bool exact = v == 0.0 || (e != 0 && e != 0x7FF && e + shift > 0 && e + shift < 0x7FF);
+	if (!exact || shift < -1022 || shift > 1023)
+		return std::ldexp(v, shift);
+	const uint64_t bits = (uint64_t)(shift + 1023) << 52;
+	double scale;
+	memcpy(&scale, &bits, sizeof(scale));
+	return v * scale;
+}
+
 static int SharedShift(const double v[3]) {
 	int e = INT_MIN;
 	for (int i = 0; i < 3; ++i) {
 		if (v[i] != 0.0)
-			e = std::max(e, std::ilogb(v[i]));
+			e = std::max(e, FastIlogb(v[i]));
 	}
 	return e == INT_MIN ? 0 : 14 - e;
 }
 
 static DepthPlane FixedPlane(const int64_t X[3], const int64_t Y[3], const double v[3], int shift) {
-	const int64_t V[3] = { (int64_t)std::ldexp(v[0], shift), (int64_t)std::ldexp(v[1], shift), (int64_t)std::ldexp(v[2], shift) };
+	const int64_t V[3] = { (int64_t)FastLdexp(v[0], shift), (int64_t)FastLdexp(v[1], shift), (int64_t)FastLdexp(v[2], shift) };
 	return ComputePlane(X, Y, V);
 }
 
@@ -1115,7 +1174,7 @@ static UVPlanes ComputeUVPlanesSTQ(const int64_t X[3], const int64_t Y[3], const
 	auto fixed = [&](const double v[3], DepthPlane *plane, double *scale, int *exp) {
 		const int shift = SharedShift(v);
 		*plane = FixedPlane(X, Y, v, shift);
-		*scale = std::ldexp(1.0, -shift);
+		*scale = FastLdexp(1.0, -shift);
 		*exp = -shift;
 	};
 	fixed(s, &planes.s, &planes.scaleS, &planes.expS);
@@ -2174,26 +2233,53 @@ void DrawRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &
 #endif
 }
 
-void DrawPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state) {
-	ScreenCoords pos = v0.screenpos;
-	Vec4<int> prim_color = Vec4<int>::FromRGBA(v0.color0);
+// A pixel of a line or point, worked out up to texturing (which ApplyFragment does). Lines and points draw
+// these in order, here and on the GPU (PackLine, PackPoint).
+struct PixelFragment {
+	int x, y;  // Drawing coordinates.
+	int z;
+	u8 fog;
+	Vec4<int> color;
+	// Added after texturing: points double it with color doubling, lines don't.
+	Vec3<int> sec;
+	bool textured;
+	bool bilinear;
+	float s, t;
+	int level, levelFrac;
+};
 
-	auto &pixelID = state.pixelID;
-	auto &samplerID = state.samplerID;
-
-	DrawingCoords p = TransformUnit::ScreenToDrawing(pos);
-	u16 z = pos.z;
-
+// The rest of a fragment's way: the early depth checks, texturing, the secondary color and the pixel.
+static void ApplyFragment(const PixelFragment &frag, const RasterizerState &state) {
+	const PixelFuncID &pixelID = state.pixelID;
 	if (pixelID.earlyZChecks) {
-		if (pixelID.applyDepthRange) {
-			if (z < pixelID.cached.minz || z > pixelID.cached.maxz)
-				return;
-		}
-
-		if (!CheckDepthTestPassed(pixelID.DepthTestFunc(), p.x, p.y, pixelID.cached.depthbufStride, z)) {
+		if (pixelID.applyDepthRange && (frag.z < pixelID.cached.minz || frag.z > pixelID.cached.maxz))
 			return;
-		}
+		if (!CheckDepthTestPassed(pixelID.DepthTestFunc(), frag.x, frag.y, pixelID.cached.depthbufStride, frag.z))
+			return;
 	}
+
+	Vec4<int> prim_color = frag.color;
+	if (frag.textured) {
+		PROFILE_THIS_SCOPE("sampler");
+		prim_color = ApplyTexturingSingle(frag.s, frag.t, ToVec4IntArg(prim_color), frag.level, frag.levelFrac, frag.bilinear, state);
+	}
+	if (!pixelID.clearMode)
+		prim_color += Vec4<int>(frag.sec, 0);
+
+	PROFILE_THIS_SCOPE("draw_px");
+	state.drawPixel(frag.x, frag.y, frag.z, frag.fog, ToVec4IntArg(prim_color), pixelID);
+}
+
+static PixelFragment PointFragment(const VertexData &v0, const RasterizerState &state) {
+	const PixelFuncID &pixelID = state.pixelID;
+	PixelFragment frag{};
+	const DrawingCoords p = TransformUnit::ScreenToDrawing(v0.screenpos);
+	frag.x = p.x;
+	frag.y = p.y;
+	frag.z = (u16)v0.screenpos.z;
+	frag.color = Vec4<int>::FromRGBA(v0.color0);
+	frag.sec = Vec3<int>::FromRGB(v0.color1) * (DoubleSecondaryColor(state) ? 2 : 1);
+	frag.fog = pixelID.applyFog ? ClampFogDepth(v0.fogdepth) : 255;
 
 	if (state.enableTextures) {
 		float s = v0.texturecoords.s();
@@ -2216,28 +2302,21 @@ void DrawPoint(const VertexData &v0, const BinCoords &range, const RasterizerSta
 			}
 		}
 
-		int texLevel;
-		int texLevelFrac;
-		bool bilinear;
-		CalculateSamplingParams(0.0f, 0.0f, 1.0f / v0.clipw, state, texLevel, texLevelFrac, bilinear);
-		PROFILE_THIS_SCOPE("sampler");
-		prim_color = ApplyTexturingSingle(s, t, ToVec4IntArg(prim_color), texLevel, texLevelFrac, bilinear, state);
+		frag.textured = true;
+		frag.s = s;
+		frag.t = t;
+		CalculateSamplingParams(0.0f, 0.0f, 1.0f / v0.clipw, state, frag.level, frag.levelFrac, frag.bilinear);
 	}
+	return frag;
+}
 
-	if (!pixelID.clearMode) {
-		Vec3<int> sec_color = Vec3<int>::FromRGB(v0.color1) * (DoubleSecondaryColor(state) ? 2 : 1);
-		prim_color += Vec4<int>(sec_color, 0);
-	}
-
-	u8 fog = 255;
-	if (pixelID.applyFog) {
-		fog = ClampFogDepth(v0.fogdepth);
-	}
-
-	PROFILE_THIS_SCOPE("draw_px");
-	state.drawPixel(p.x, p.y, z, fog, ToVec4IntArg(prim_color), pixelID);
+void DrawPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state) {
+	const PixelFragment frag = PointFragment(v0, state);
+	ApplyFragment(frag, state);
 
 #if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	const PixelFuncID &pixelID = state.pixelID;
+	const DrawingCoords p = TransformUnit::ScreenToDrawing(v0.screenpos);
 	uint32_t bpp = pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
 	std::string tag = StringFromFormat("DisplayListP_%08x", state.listPC);
 
@@ -2597,9 +2676,9 @@ static LineUV ComputeLineUV(const VertexData &v0, const VertexData &v1, bool tex
 	}
 	auto fixed = [](const double c[2], int64_t out[2], double *scale) {
 		const int shift = SharedShift2(c);
-		out[0] = (int64_t)std::ldexp(c[0], shift);
-		out[1] = (int64_t)std::ldexp(c[1], shift);
-		*scale = std::ldexp(1.0, -shift);
+		out[0] = (int64_t)FastLdexp(c[0], shift);
+		out[1] = (int64_t)FastLdexp(c[1], shift);
+		*scale = FastLdexp(1.0, -shift);
 	};
 	fixed(s, uv.s, &uv.scaleS);
 	fixed(t, uv.t, &uv.scaleT);
@@ -2629,7 +2708,9 @@ static int LineColorAt(int c0, int c1, int64_t x0, int64_t y0, int64_t x1, int64
 	return LineValueAt(c0, c1, x0, y0, x1, y1, px, py, 255);
 }
 
-void DrawLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state) {
+// The pixels a line draws, in order, as fragments up to texturing (ApplyFragment does the rest).
+template <typename F>
+static void ForLineFragments(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, F emit) {
 	// TODO: Use a proper line drawing algorithm that handles fractional endpoints correctly.
 	Vec3<int> a(v0.screenpos.x, v0.screenpos.y, v0.screenpos.z);
 	Vec3<int> b(v1.screenpos.x, v1.screenpos.y, v1.screenpos.z);
@@ -2662,11 +2743,6 @@ void DrawLine(const VertexData &v0, const VertexData &v1, const BinCoords &range
 	const Vec3<int> v0_c1 = Vec3<int>::FromRGB(v0.color1);
 	const Vec3<int> v1_c1 = Vec3<int>::FromRGB(v1.color1);
 
-#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
-	std::string tag = StringFromFormat("DisplayListL_%08x", state.listPC);
-	std::string ztag = StringFromFormat("DisplayListLZ_%08x", state.listPC);
-#endif
-
 	const int steps1 = steps == 0 ? 1 : steps;
 	const LineUV lineUV = state.enableTextures && !state.throughMode ? ComputeLineUV(v0, v1, state.textureProj) : LineUV{};
 	static thread_local std::vector<LinePixel> pixels;
@@ -2680,21 +2756,9 @@ void DrawLine(const VertexData &v0, const VertexData &v1, const BinCoords &range
 		const int z = LineValueAt(a.z, b.z, a.x, a.y, b.x, b.y, lp.x, lp.y, 65535);
 		DrawingCoords p = TransformUnit::ScreenToDrawing(x, y);
 
-		bool maskOK = x >= range.x1 && y >= range.y1 && x <= range.x2 && y <= range.y2;
+		const bool maskOK = x >= range.x1 && y >= range.y1 && x <= range.x2 && y <= range.y2;
 		if (maskOK) {
-			if (pixelID.earlyZChecks) {
-				if (pixelID.applyDepthRange) {
-					if (z < pixelID.cached.minz || z > pixelID.cached.maxz)
-						maskOK = false;
-				}
-
-				if (!CheckDepthTestPassed(pixelID.DepthTestFunc(), p.x, p.y, pixelID.cached.depthbufStride, z)) {
-					maskOK = false;
-				}
-			}
-		}
-
-		if (maskOK) {
+			PixelFragment frag{};
 			// Interpolate between the two points.
 			Vec4<int> prim_color;
 			Vec3<int> sec_color;
@@ -2766,30 +2830,46 @@ void DrawLine(const VertexData &v0, const VertexData &v1, const BinCoords &range
 					texBilinear = true;
 				}
 
-				PROFILE_THIS_SCOPE("sampler");
-				prim_color = ApplyTexturingSingle(s, t, ToVec4IntArg(prim_color), texLevel, texLevelFrac, texBilinear, state);
+				frag.textured = true;
+				frag.s = s;
+				frag.t = t;
+				frag.level = texLevel;
+				frag.levelFrac = texLevelFrac;
+				frag.bilinear = texBilinear;
 			}
 
-			if (!pixelID.clearMode)
-				prim_color += Vec4<int>(sec_color, 0);
-
-			PROFILE_THIS_SCOPE("draw_px");
-			state.drawPixel(p.x, p.y, z, fog, ToVec4IntArg(prim_color), pixelID);
-
-#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
-			uint32_t bpp = pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
-			uint32_t row = gstate.getFrameBufAddress() + p.y * pixelID.cached.framebufStride * bpp;
-			NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * bpp, bpp, tag.c_str(), tag.size());
-
-			if (pixelID.depthWrite) {
-				uint32_t row = gstate.getDepthBufAddress() + y * pixelID.cached.depthbufStride * 2;
-				NotifyMemInfo(MemBlockFlags::WRITE, row + p.x * 2, 2, ztag.c_str(), ztag.size());
-			}
-#endif
+			frag.x = p.x;
+			frag.y = p.y;
+			frag.z = z;
+			frag.fog = fog;
+			frag.color = prim_color;
+			frag.sec = sec_color;
+			emit(frag);
 		}
-
 	}
 }
+
+void DrawLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state) {
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+	const PixelFuncID &pixelID = state.pixelID;
+	std::string tag = StringFromFormat("DisplayListL_%08x", state.listPC);
+	std::string ztag = StringFromFormat("DisplayListLZ_%08x", state.listPC);
+#endif
+	ForLineFragments(v0, v1, range, state, [&](const PixelFragment &frag) {
+		ApplyFragment(frag, state);
+#if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
+		uint32_t bpp = pixelID.FBFormat() == GE_FORMAT_8888 ? 4 : 2;
+		uint32_t row = gstate.getFrameBufAddress() + frag.y * pixelID.cached.framebufStride * bpp;
+		NotifyMemInfo(MemBlockFlags::WRITE, row + frag.x * bpp, bpp, tag.c_str(), tag.size());
+
+		if (pixelID.depthWrite) {
+			uint32_t row = gstate.getDepthBufAddress() + frag.y * pixelID.cached.depthbufStride * 2;
+			NotifyMemInfo(MemBlockFlags::WRITE, row + frag.x * 2, 2, ztag.c_str(), ztag.size());
+		}
+#endif
+	});
+}
+
 
 bool GetCurrentTexture(GPUDebugBuffer &buffer, int level)
 {
@@ -2833,6 +2913,442 @@ bool GetCurrentTexture(GPUDebugBuffer &buffer, int level)
 		}
 		row += w;
 	}
+	return true;
+}
+
+
+// The setup for the compute rasterizer (ComputeRaster.h). Each mirrors the drawing function above it, up to
+// where that one walks the pixels.
+
+// Whether base + kx x + ky y stays within 32 bits for x0 <= x <= x1, y0 <= y <= y1 (it's linear, so the corners
+// are the extremes). The shader then sums it in 32-bit wrapping arithmetic, which comes out exact.
+static bool LinearFits32(int64_t base, int64_t kx, int64_t ky, int64_t x0, int64_t x1, int64_t y0, int64_t y1) {
+	constexpr int64_t limit = (int64_t)1 << 31;
+	const int64_t xs[2] = { x0, x1 }, ys[2] = { y0, y1 };
+	for (int64_t x : xs) {
+		for (int64_t y : ys) {
+			const int64_t v = base + kx * x + ky * y;
+			if (v >= limit || v < -limit)
+				return false;
+		}
+	}
+	return true;
+}
+
+// The level of detail's base for a primitive with UV planes (ApplyTexturing, CalculateSamplingParams): the
+// detail is this, less GELog16(q) when usesQ, plus the state's bias.
+static int LodBase(const RasterizerState &state, float autoGrad, bool *usesQ) {
+	*usesQ = false;
+	switch (state.TexLevelMode()) {
+	case GE_TEXLEVEL_MODE_AUTO:
+		if (autoGrad >= 0.0f) {
+			*usesQ = true;
+			return GELog16(autoGrad);
+		}
+		return GELog16(0.0f);
+	case GE_TEXLEVEL_MODE_SLOPE:
+		*usesQ = true;
+		return 16 + GELog16(state.textureLodSlope);
+	default:
+		return 0;
+	}
+}
+
+static void PushUVPlanes(SoftCompute::PrimWords &prims, const UVPlanes &uv) {
+	SoftCompute::PushPlane(prims, uv.q.base, uv.q.kx, uv.q.ky);
+	SoftCompute::PushPlane(prims, uv.s.base, uv.s.kx, uv.s.ky);
+	SoftCompute::PushPlane(prims, uv.t.base, uv.t.kx, uv.t.ky);
+}
+
+bool PackTriangle(const VertexData &v0, const VertexData &v1, const VertexData &v2, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
+	using namespace SoftCompute;
+	const PixelFuncID &pixelID = state.pixelID;
+	const bool clearMode = pixelID.clearMode;
+
+	// Rows and the scissor's columns, as DrawTriangleSlice walks them. Range() aligns y1 to a pixel.
+	auto floorDiv = [](int64_t n, int64_t m) {
+		return n >= 0 ? n / m : -((-n + m - 1) / m);
+	};
+	const int px1 = (int)-floorDiv(-(int64_t)range.x1, SCREEN_SCALE_FACTOR);
+	const int px2 = (int)floorDiv(range.x2, SCREEN_SCALE_FACTOR);
+	_dbg_assert_((range.y1 & (SCREEN_SCALE_FACTOR - 1)) == 0);
+	const int py1 = range.y1 / SCREEN_SCALE_FACTOR;
+	const int py2 = py1 + (range.y2 - range.y1) / SCREEN_SCALE_FACTOR;
+	if (px1 > px2 || range.y2 < range.y1)
+		return false;
+
+	const bool flatZ = v0.screenpos.z == v1.screenpos.z && v0.screenpos.z == v2.screenpos.z;
+	const bool flatColorAll = !state.shadeGouraud;
+	const bool flatColor0 = flatColorAll || (v0.color0 == v1.color0 && v0.color0 == v2.color0);
+	const bool flatColor1 = flatColorAll || (v0.color1 == v1.color1 && v0.color1 == v2.color1);
+	const bool noFog = clearMode || !pixelID.applyFog || (v0.fogdepth >= 255.0f / 256.0f && v1.fogdepth >= 255.0f / 256.0f && v2.fogdepth >= 255.0f / 256.0f);
+
+	if (pixelID.applyDepthRange && flatZ) {
+		if (v0.screenpos.z < pixelID.cached.minz || v0.screenpos.z > pixelID.cached.maxz)
+			return false;
+	}
+
+	const UVPlanes uvPlanes = state.enableTextures ? ComputeUVPlanes(v0, v1, v2, state.textureProj && !state.throughMode) : UVPlanes{};
+	if (state.enableTextures && !uvPlanes.valid) {
+		// Drawn on the CPU instead (TriangleNeedsCPU).
+		return false;
+	}
+
+	// The snapping long edge of a very tall triangle (see DrawTriangleSlice).
+	int snapEdge = -1;
+	bool snapLeft = false;
+	{
+		const VertexData *vs[3] = { &v0, &v1, &v2 };
+		int top = 0, bot = 0;
+		for (int i = 1; i < 3; ++i) {
+			if (vs[i]->screenpos.y < vs[top]->screenpos.y)
+				top = i;
+			if (vs[i]->screenpos.y > vs[bot]->screenpos.y || (vs[i]->screenpos.y == vs[bot]->screenpos.y && vs[i]->screenpos.x < vs[bot]->screenpos.x))
+				bot = i;
+		}
+		const int64_t dy = (int64_t)vs[bot]->screenpos.y - vs[top]->screenpos.y;
+		if (top != bot && 3 * dy > (1 << 17)) {
+			const int third = 3 - top - bot;
+			snapEdge = third;
+			const int64_t ex = (int64_t)(vs[bot]->screenpos.x - vs[top]->screenpos.x) * (vs[third]->screenpos.y - vs[top]->screenpos.y);
+			snapLeft = (int64_t)(vs[third]->screenpos.x - vs[top]->screenpos.x) * dy > ex;
+		}
+	}
+
+	const int biases[3] = {
+		IsRightSideOrFlatBottomLine(v0.screenpos.xy(), v1.screenpos.xy(), v2.screenpos.xy()) ? -1 : 0,
+		IsRightSideOrFlatBottomLine(v1.screenpos.xy(), v2.screenpos.xy(), v0.screenpos.xy()) ? -1 : 0,
+		IsRightSideOrFlatBottomLine(v2.screenpos.xy(), v0.screenpos.xy(), v1.screenpos.xy()) ? -1 : 0,
+	};
+	const ScreenCoords *edgeEnds[3][2] = { { &v1.screenpos, &v2.screenpos }, { &v2.screenpos, &v0.screenpos }, { &v0.screenpos, &v1.screenpos } };
+	int64_t ea[3], eb[3], ec[3];
+	for (int k = 0; k < 3; ++k) {
+		const ScreenCoords &a = *edgeEnds[k][0], &b = *edgeEnds[k][1];
+		ea[k] = (int64_t)(a.y - b.y);
+		eb[k] = (int64_t)(b.x - a.x);
+		ec[k] = (int64_t)b.y * a.x - (int64_t)b.x * a.y + biases[k];
+	}
+
+	// What the shader evaluates: pixel centers in these rows, from three pixels left of the first span (the snap
+	// edge and the mip level's q look around a pixel's span) to three right of the last.
+	const int64_t evalX0 = (int64_t)((px1 & ~3) - 3) * SCREEN_SCALE_FACTOR + SCREEN_SCALE_FACTOR / 2;
+	const int64_t evalX1 = (int64_t)((px2 | 3) + 3) * SCREEN_SCALE_FACTOR + SCREEN_SCALE_FACTOR / 2;
+	const int64_t evalY0 = (int64_t)py1 * SCREEN_SCALE_FACTOR + SCREEN_SCALE_FACTOR / 2;
+	const int64_t evalY1 = (int64_t)py2 * SCREEN_SCALE_FACTOR + SCREEN_SCALE_FACTOR / 2;
+
+	uint32_t flags = 0;
+	bool edges32 = true;
+	for (int k = 0; k < 3; ++k)
+		edges32 = edges32 && LinearFits32(ec[k], ea[k], eb[k], evalX0, evalX1, evalY0, evalY1);
+	if (edges32)
+		flags |= PRIMF_EDGES32;
+
+	const DepthPlane depthPlane = flatZ ? DepthPlane{} : ComputeDepthPlane(v0, v1, v2);
+	const float autoGrad = UVPlaneGradient(uvPlanes, state, state.throughMode);
+	DepthPlane color0Planes[4], color1Planes[3];
+	DepthPlane fogPlane{};
+	if (!noFog) {
+		const int64_t X[3] = { v0.screenpos.x, v1.screenpos.x, v2.screenpos.x };
+		const int64_t Y[3] = { v0.screenpos.y, v1.screenpos.y, v2.screenpos.y };
+		const int64_t F[3] = { ClampFogDepth(v0.fogdepth), ClampFogDepth(v1.fogdepth), ClampFogDepth(v2.fogdepth) };
+		fogPlane = ComputePlane(X, Y, F);
+	}
+	if (!flatColor0)
+		ComputeColorPlanes<4>(v0, v1, v2, v0.color0, v1.color0, v2.color0, color0Planes);
+	if (!flatColor1)
+		ComputeColorPlanes<3>(v0, v1, v2, v0.color1, v1.color1, v2.color1, color1Planes);
+
+	const DepthPlane *planes[12];
+	int numPlanes = 0;
+	if (!flatZ)
+		planes[numPlanes++] = &depthPlane;
+	if (!noFog)
+		planes[numPlanes++] = &fogPlane;
+	if (!flatColor0) {
+		for (int c = 0; c < 4; ++c)
+			planes[numPlanes++] = &color0Planes[c];
+	}
+	if (!flatColor1) {
+		for (int c = 0; c < 3; ++c)
+			planes[numPlanes++] = &color1Planes[c];
+	}
+	if (uvPlanes.valid) {
+		planes[numPlanes++] = &uvPlanes.q;
+		planes[numPlanes++] = &uvPlanes.s;
+		planes[numPlanes++] = &uvPlanes.t;
+	}
+	bool planes32 = true;
+	for (int i = 0; i < numPlanes; ++i)
+		planes32 = planes32 && LinearFits32(planes[i]->base, planes[i]->kx, planes[i]->ky, evalX0, evalX1, evalY0, evalY1);
+	if (planes32)
+		flags |= PRIMF_PLANES32;
+
+	if (flatZ)
+		flags |= PRIMF_FLATZ;
+	if (flatColor0)
+		flags |= PRIMF_FLAT_C0;
+	if (flatColor1)
+		flags |= PRIMF_FLAT_C1;
+	if (noFog)
+		flags |= PRIMF_NOFOG;
+	int lodBase = 0;
+	if (uvPlanes.valid) {
+		flags |= PRIMF_UV;
+		bool usesQ;
+		lodBase = LodBase(state, autoGrad, &usesQ);
+		if (usesQ)
+			flags |= PRIMF_LOD_USES_Q;
+		const bool lodUsesQ = state.TexLevelMode() != GE_TEXLEVEL_MODE_CONST && (state.maxTexLevel > 0 || state.minFilt != state.magFilt);
+		if (lodUsesQ && !state.throughMode)
+			flags |= PRIMF_LODQ;
+		if (uvPlanes.q.rightAnchored)
+			flags |= PRIMF_Q_RTL;
+		if (state.throughMode)
+			flags |= PRIMF_THROUGH_UV;
+	}
+
+	BeginPrim(prims, PrimType::TRIANGLE, flags, stateIndex, px1, py1, px2, py2);
+	for (int k = 0; k < 3; ++k) {
+		prims.push_back((uint32_t)(int32_t)ea[k]);
+		prims.push_back((uint32_t)(int32_t)eb[k]);
+		prims.push_back((uint32_t)(uint64_t)ec[k]);
+		prims.push_back((uint32_t)((uint64_t)ec[k] >> 32));
+	}
+	prims.push_back(((uint32_t)snapEdge & 0xFF) | (snapLeft ? 0x100 : 0));
+	prims.push_back((uint32_t)v2.screenpos.z);
+	prims.push_back(v2.color0);
+	prims.push_back(v2.color1 & 0x00FFFFFF);
+	prims.push_back((uint32_t)lodBase);
+	prims.push_back((uint32_t)uvPlanes.expS);
+	prims.push_back((uint32_t)uvPlanes.expT);
+	prims.push_back((uint32_t)uvPlanes.expQ);
+	for (int i = 0; i < numPlanes; ++i)
+		PushPlane(prims, planes[i]->base, planes[i]->kx, planes[i]->ky);
+	return true;
+}
+
+bool PackRectangle(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
+	using namespace SoftCompute;
+	// As DrawRectangle.
+	int entireX1 = std::min(v0.screenpos.x, v1.screenpos.x);
+	int entireY1 = std::min(v0.screenpos.y, v1.screenpos.y);
+	int entireX2 = std::max(v0.screenpos.x, v1.screenpos.x) - 1;
+	int entireY2 = std::max(v0.screenpos.y, v1.screenpos.y) - 1;
+	int minX = std::max(entireX1 & ~(SCREEN_SCALE_FACTOR - 1), range.x1) | (SCREEN_SCALE_FACTOR / 2 - 1);
+	int minY = std::max(entireY1 & ~(SCREEN_SCALE_FACTOR - 1), range.y1) | (SCREEN_SCALE_FACTOR / 2 - 1);
+	int maxX = std::min(entireX2 - 1, range.x2);
+	int maxY = std::min(entireY2 - 1, range.y2);
+	if (minX < entireX1 - 2)
+		minX += SCREEN_SCALE_FACTOR;
+	const bool rotated = v0.screenpos.x < v1.screenpos.x && v0.screenpos.y > v1.screenpos.y;
+	if (minY < entireY1 - (rotated ? 2 : 1))
+		minY += SCREEN_SCALE_FACTOR;
+	if (maxX < minX || maxY < minY)
+		return false;
+
+	if (state.pixelID.applyDepthRange) {
+		if (v1.screenpos.z < state.pixelID.cached.minz || v1.screenpos.z > state.pixelID.cached.maxz)
+			return false;
+	}
+
+	// Pixel centers are at 16k + 7 here.
+	const int px1 = minX / SCREEN_SCALE_FACTOR, py1 = minY / SCREEN_SCALE_FACTOR;
+	const int px2 = px1 + (maxX - minX) / SCREEN_SCALE_FACTOR, py2 = py1 + (maxY - minY) / SCREEN_SCALE_FACTOR;
+
+	UVPlanes uvPlanes{};
+	if (state.enableTextures) {
+		Vec2f tc0 = v0.texturecoords.uv();
+		Vec2f tc1 = v1.texturecoords.uv();
+		if (state.throughMode) {
+			tc0.s() *= 1.0f / (float)(1 << state.samplerID.width0Shift);
+			tc1.s() *= 1.0f / (float)(1 << state.samplerID.width0Shift);
+			tc0.t() *= 1.0f / (float)(1 << state.samplerID.height0Shift);
+			tc1.t() *= 1.0f / (float)(1 << state.samplerID.height0Shift);
+		}
+		const bool right = v0.screenpos.x < v1.screenpos.x, down = v0.screenpos.y < v1.screenpos.y;
+		const bool swapST = right != down;
+		const VertexData *vs[2] = { &v0, &v1 };
+		double S[2], T[2], Q[2];
+		for (int k = 0; k < 2; ++k) {
+			const double r = state.throughMode ? 1.0 : GERecip(TruncateToFloat24(vs[k]->clipw));
+			Q[k] = r;
+			S[k] = ProductToFloat24((double)TruncateToFloat24(k == 0 ? tc0.s() : tc1.s()) * r);
+			T[k] = ProductToFloat24((double)TruncateToFloat24(k == 0 ? tc0.t() : tc1.t()) * r);
+		}
+		const int64_t left = std::min(v0.screenpos.x, v1.screenpos.x), top = std::min(v0.screenpos.y, v1.screenpos.y);
+		const int64_t rightX = std::max(v0.screenpos.x, v1.screenpos.x), bottom = std::max(v0.screenpos.y, v1.screenpos.y);
+		const bool bottomLeftFirst = right && !down;
+		const int64_t CX[3] = { left, rightX, bottomLeftFirst ? rightX : left };
+		const int64_t CY[3] = { bottomLeftFirst ? bottom : top, top, bottom };
+		double cs[3], ct[3], cq[3];
+		for (int k = 0; k < 3; ++k) {
+			const int xs = CX[k] == v0.screenpos.x ? 0 : 1, ys = CY[k] == v0.screenpos.y ? 0 : 1;
+			cs[k] = S[swapST ? ys : xs];
+			ct[k] = T[swapST ? xs : ys];
+			cq[k] = Q[xs];
+		}
+		uvPlanes = ComputeUVPlanesSTQ(CX, CY, cs, ct, cq);
+	}
+	const float autoGrad = UVPlaneGradient(uvPlanes, state, false);
+
+	uint32_t flags = 0;
+	int lodBase = 0;
+	if (uvPlanes.valid) {
+		flags |= PRIMF_UV;
+		bool usesQ;
+		lodBase = LodBase(state, autoGrad, &usesQ);
+		if (usesQ)
+			flags |= PRIMF_LOD_USES_Q;
+		const int64_t x0 = (int64_t)px1 * SCREEN_SCALE_FACTOR + SCREEN_SCALE_FACTOR / 2, x1 = (int64_t)px2 * SCREEN_SCALE_FACTOR + SCREEN_SCALE_FACTOR / 2;
+		const int64_t y0 = (int64_t)py1 * SCREEN_SCALE_FACTOR + SCREEN_SCALE_FACTOR / 2, y1 = (int64_t)py2 * SCREEN_SCALE_FACTOR + SCREEN_SCALE_FACTOR / 2;
+		if (LinearFits32(uvPlanes.q.base, uvPlanes.q.kx, uvPlanes.q.ky, x0, x1, y0, y1) && LinearFits32(uvPlanes.s.base, uvPlanes.s.kx, uvPlanes.s.ky, x0, x1, y0, y1) && LinearFits32(uvPlanes.t.base, uvPlanes.t.kx, uvPlanes.t.ky, x0, x1, y0, y1))
+			flags |= PRIMF_PLANES32;
+	}
+
+	BeginPrim(prims, PrimType::RECT, flags, stateIndex, px1, py1, px2, py2);
+	prims.push_back((uint32_t)v1.screenpos.z);
+	prims.push_back(ClampFogDepth(v1.fogdepth));
+	prims.push_back(v1.color0);
+	prims.push_back(v1.color1 & 0x00FFFFFF);
+	prims.push_back((uint32_t)lodBase);
+	prims.push_back((uint32_t)uvPlanes.expS);
+	prims.push_back((uint32_t)uvPlanes.expT);
+	prims.push_back((uint32_t)uvPlanes.expQ);
+	if (uvPlanes.valid)
+		PushUVPlanes(prims, uvPlanes);
+	return true;
+}
+
+bool PackClearRect(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
+	using namespace SoftCompute;
+	// As ClearRectangle.
+	int entireX1 = std::min(v0.screenpos.x, v1.screenpos.x);
+	int entireY1 = std::min(v0.screenpos.y, v1.screenpos.y);
+	int entireX2 = std::max(v0.screenpos.x, v1.screenpos.x) - 1;
+	int entireY2 = std::max(v0.screenpos.y, v1.screenpos.y) - 1;
+	int minX = std::max(entireX1 & ~(SCREEN_SCALE_FACTOR - 1), range.x1) | (SCREEN_SCALE_FACTOR / 2 - 1);
+	int minY = std::max(entireY1 & ~(SCREEN_SCALE_FACTOR - 1), range.y1) | (SCREEN_SCALE_FACTOR / 2 - 1);
+	int maxX = std::min(entireX2, range.x2);
+	int maxY = std::min(entireY2, range.y2);
+	if (minX < entireX1 - 1)
+		minX += SCREEN_SCALE_FACTOR;
+	if (minY < entireY1 - 1)
+		minY += SCREEN_SCALE_FACTOR;
+
+	const DrawingCoords pprime = TransformUnit::ScreenToDrawing(minX, minY);
+	const DrawingCoords pend = TransformUnit::ScreenToDrawing(maxX - SCREEN_SCALE_FACTOR / 2, maxY - SCREEN_SCALE_FACTOR / 2);
+	if (pend.x < pprime.x || pend.y < pprime.y)
+		return false;
+
+	BeginPrim(prims, PrimType::CLEAR_RECT, 0, stateIndex, pprime.x, pprime.y, pend.x, pend.y);
+	prims.push_back((uint32_t)(u16)v1.screenpos.z);
+	prims.push_back(v1.color0);
+	return true;
+}
+
+bool PackSprite(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
+	using namespace SoftCompute;
+	// As DrawSprite.
+	DrawingCoords pos0 = TransformUnit::ScreenToDrawing(v0.screenpos);
+	DrawingCoords pos1 = TransformUnit::ScreenToDrawing(v1.screenpos + ScreenCoords(7, 7, 0));
+	const DrawingCoords scissorTL = TransformUnit::ScreenToDrawing(range.x1, range.y1);
+	const DrawingCoords scissorBR = TransformUnit::ScreenToDrawing(range.x2, range.y2);
+
+	const int z = v1.screenpos.z;
+	if (state.pixelID.applyDepthRange && (z < state.pixelID.cached.minz || z > state.pixelID.cached.maxz))
+		return false;
+
+	int ds = 0, dt = 0, s_start = 0, t_start = 0;
+	if (state.enableTextures) {
+		ds = v1.texturecoords.x > v0.texturecoords.x ? 1 : -1;
+		dt = v1.texturecoords.y > v0.texturecoords.y ? 1 : -1;
+		s_start = (int)floorf(v0.texturecoords.x + 0.5f * ds);
+		t_start = (int)floorf(v0.texturecoords.y + 0.5f * dt);
+	}
+	if (pos1.x > scissorBR.x) pos1.x = scissorBR.x + 1;
+	if (pos1.y > scissorBR.y) pos1.y = scissorBR.y + 1;
+	if (pos0.x < scissorTL.x) {
+		s_start += (scissorTL.x - pos0.x) * ds;
+		pos0.x = scissorTL.x;
+	}
+	if (pos0.y < scissorTL.y) {
+		t_start += (scissorTL.y - pos0.y) * dt;
+		pos0.y = scissorTL.y;
+	}
+	if (pos1.x <= pos0.x || pos1.y <= pos0.y)
+		return false;
+
+	BeginPrim(prims, PrimType::SPRITE, state.enableTextures ? PRIMF_TEXTURED : 0, stateIndex, pos0.x, pos0.y, pos1.x - 1, pos1.y - 1);
+	prims.push_back((uint32_t)s_start);
+	prims.push_back((uint32_t)t_start);
+	prims.push_back((uint32_t)ds);
+	prims.push_back((uint32_t)dt);
+	prims.push_back((uint32_t)z);
+	prims.push_back(v1.color0);
+	return true;
+}
+
+// Fragments, which the shader draws as ApplyFragment does.
+static void PushFragment(SoftCompute::PrimWords &prims, const PixelFragment &frag) {
+	using namespace SoftCompute;
+	prims.push_back((uint32_t)(frag.x & 0xFFFF) | ((uint32_t)frag.y << 16));
+	prims.push_back((uint32_t)frag.z);
+	prims.push_back((uint32_t)frag.fog | (frag.textured ? 0x100 : 0) | (frag.bilinear ? 0x200 : 0) | ((uint32_t)frag.level << 16) | ((uint32_t)frag.levelFrac << 24));
+	prims.push_back(Vec4<int>(frag.color).Clamp(0, 255).ToRGBA());
+	// Up to 510 each, when doubled.
+	prims.push_back((uint32_t)frag.sec.r() | ((uint32_t)frag.sec.g() << 10) | ((uint32_t)frag.sec.b() << 20));
+	uint32_t bits;
+	memcpy(&bits, &frag.s, 4);
+	prims.push_back(bits);
+	memcpy(&bits, &frag.t, 4);
+	prims.push_back(bits);
+	prims.push_back(0);
+}
+
+bool PackLine(const VertexData &v0, const VertexData &v1, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
+	using namespace SoftCompute;
+	const size_t start = prims.size();
+	BeginPrim(prims, PrimType::FRAGMENTS, 0, stateIndex, 0, 0, 0, 0);
+	prims.push_back(0);
+	int count = 0;
+	int x1 = INT_MAX, y1 = INT_MAX, x2 = INT_MIN, y2 = INT_MIN;
+	ForLineFragments(v0, v1, range, state, [&](const PixelFragment &frag) {
+		PushFragment(prims, frag);
+		x1 = std::min(x1, frag.x);
+		y1 = std::min(y1, frag.y);
+		x2 = std::max(x2, frag.x);
+		y2 = std::max(y2, frag.y);
+		count++;
+	});
+	if (count == 0) {
+		prims.resize(start);
+		return false;
+	}
+	prims[start + PRIM_XY1] = (uint32_t)(x1 & 0xFFFF) | ((uint32_t)y1 << 16);
+	prims[start + PRIM_XY2] = (uint32_t)(x2 & 0xFFFF) | ((uint32_t)y2 << 16);
+	prims[start + PRIM_HEADER_WORDS + FRAG_COUNT] = count;
+	return true;
+}
+
+// Without UV planes (a w that isn't positive and finite), DrawTriangleSlice interpolates UVs from the edge
+// weights, in float.
+bool TriangleNeedsCPU(const VertexData &v0, const VertexData &v1, const VertexData &v2, const RasterizerState &state) {
+	if (!state.enableTextures)
+		return false;
+	for (const VertexData *v : { &v0, &v1, &v2 }) {
+		const float w24 = TruncateToFloat24(v->clipw);
+		if (!(w24 > 0.0f) || !std::isfinite(w24))
+			return true;
+	}
+	return false;
+}
+
+bool PackPoint(const VertexData &v0, const BinCoords &range, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
+	using namespace SoftCompute;
+	const PixelFragment frag = PointFragment(v0, state);
+	BeginPrim(prims, PrimType::FRAGMENTS, 0, stateIndex, frag.x, frag.y, frag.x, frag.y);
+	prims.push_back(1);
+	PushFragment(prims, frag);
 	return true;
 }
 

@@ -493,6 +493,7 @@ ARCH_FILES := \
 endif
 
 GPU_VULKAN_FILES := \
+  $(SRC)/GPU/Vulkan/ComputeRasterVulkan.cpp \
   $(SRC)/GPU/Vulkan/DrawEngineVulkan.cpp \
   $(SRC)/GPU/Vulkan/FramebufferManagerVulkan.cpp \
   $(SRC)/GPU/Vulkan/GPU_Vulkan.cpp \

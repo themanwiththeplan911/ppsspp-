@@ -302,6 +302,14 @@ public:
 
 	bool bSoftwareRendering;
 	bool bSoftwareRenderingJit;
+	// On Vulkan, the software renderer rasterizes with compute shaders unless this is off.
+	bool bSoftwareRenderingCompute;
+	// How it gets shaders specialized for what a segment uses: 0 compiles them in the background, 1 waits for
+	// them, 2 uses the one that does everything.
+	int iSoftwareComputeVariants;
+	// Leaves what it drew on the GPU at list syncs and the display, as the hardware renderers do, instead of
+	// copying it back to PSP memory: the CPU seeing it there late is rare, and copying every frame stalls.
+	bool bSoftwareComputeLazyReadback;
 	bool bSoftwareDisableDithering;
 	bool bHardwareTransform;
 	bool bVendorBugChecksEnabled;

@@ -28,6 +28,8 @@ set(GPU_GLES
 )
 
 set(GPU_VULKAN
+	Vulkan/ComputeRasterShader.h
+	Vulkan/ComputeRasterVulkan.cpp
 	Vulkan/DebugVisVulkan.cpp
 	Vulkan/DebugVisVulkan.h
 	Vulkan/DrawEngineVulkan.cpp
@@ -170,6 +172,7 @@ set(GPU_SOURCES
 	Software/BinManager.h
 	Software/Clipper.cpp
 	Software/Clipper.h
+	Software/ComputeRaster.h
 	Software/DrawPixel.cpp
 	Software/DrawPixel.h
 	Software/FuncId.cpp

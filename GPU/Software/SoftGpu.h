@@ -244,7 +244,9 @@ protected:
 	void FastRunLoop(DisplayList &list) override;
 	void CopyToCurrentFboFromDisplayRam(const DisplayLayoutConfig &config, int srcwidth, int srcheight);
 	void ConvertTextureDescFrom16(Draw::TextureDesc &desc, int srcwidth, int srcheight, const uint16_t *overrideData = nullptr);
+	void SyncDebugRead();
 	bool DarkStalkersStretchActive() const;
+	void UpdateComputeBackend();
 	void GetDarkStalkersDisplay(GPUDebugBuffer &buffer);
 
 	void BuildReportingInfo() override {}
@@ -270,6 +272,8 @@ private:
 
 	Draw::Texture *fbTex = nullptr;
 	std::vector<u32> fbTexBuffer_;
+	// The compute rasterizer couldn't start on this device.
+	bool computeFailed_ = false;
 };
 
 // TODO: These shouldn't be global.

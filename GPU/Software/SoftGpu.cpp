@@ -39,6 +39,7 @@
 #include "Common/GPU/thin3d.h"
 
 #include "GPU/GPUCommon.h"
+#include "GPU/Software/ComputeRaster.h"
 #include "GPU/Software/DrawPixel.h"
 #include "GPU/Software/Rasterizer.h"
 #include "GPU/Software/Sampler.h"
@@ -455,9 +456,34 @@ SoftGPU::SoftGPU(GraphicsContext *gfxCtx, Draw::DrawContext *draw)
 	NotifyConfigChanged();
 	NotifyDisplayResized();
 	// NotifyRenderResized();  // hopefully not needed here.
+	UpdateComputeBackend();
+}
+
+// On Vulkan, rasterize with compute shaders unless the config says not to.
+void SoftGPU::UpdateComputeBackend() {
+	TransformUnit &transformUnit = drawEngine_->transformUnit;
+	const bool want = draw_ && GetGPUBackend() == GPUBackend::VULKAN && g_Config.bSoftwareRenderingCompute;
+	if (!want) {
+		computeFailed_ = false;
+		if (transformUnit.ComputeActive())
+			transformUnit.SetComputeBackend(this, nullptr);
+		return;
+	}
+#if !PPSSPP_PLATFORM(SWITCH) && !PPSSPP_PLATFORM(UWP)
+	if (!transformUnit.ComputeActive() && !computeFailed_) {
+		SoftCompute::Backend *backend = SoftCompute::CreateVulkanBackend(draw_);
+		if (backend)
+			transformUnit.SetComputeBackend(this, backend);
+		else
+			computeFailed_ = true;
+	}
+#endif
 }
 
 void SoftGPU::DeviceLost() {
+	// What's queued for the GPU is lost with it.
+	if (drawEngine_->transformUnit.ComputeActive())
+		drawEngine_->transformUnit.SetComputeBackend(this, nullptr);
 	if (presentation_)
 		presentation_->DeviceLost();
 	draw_ = nullptr;
@@ -472,6 +498,7 @@ void SoftGPU::DeviceRestore(Draw::DrawContext *draw) {
 	if (presentation_)
 		presentation_->DeviceRestore(draw_);
 	PPGeSetDrawContext(draw_);
+	UpdateComputeBackend();
 }
 
 SoftGPU::~SoftGPU() {
@@ -616,6 +643,16 @@ void SoftGPU::CopyToCurrentFboFromDisplayRam(const DisplayLayoutConfig &config, 
 
 	OutputFlags outputFlags = config.iDisplayFilter == SCALE_NEAREST ? OutputFlags::NEAREST : OutputFlags::LINEAR;
 	bool hasPostShader = presentation_ && presentation_->HasPostShader();
+
+	// With compute rasterization, the display can come straight from the GPU's copy of memory.
+	if (!DarkStalkersStretchActive() && displayStride_ != 0 && drawEngine_->transformUnit.ComputeActive()) {
+		fbTex = drawEngine_->transformUnit.ComputeDisplayTexture(displayFramebuf_, displayStride_, displayFormat_, srcwidth, srcheight);
+		if (fbTex) {
+			presentation_->SourceTexture(fbTex, srcwidth, srcheight);
+			presentation_->RunPostshaderPasses(config, outputFlags, config.iInternalScreenRotation, 0.0f, 0.0f, 1.0f, 1.0f);
+			return;
+		}
+	}
 
 	if (DarkStalkersStretchActive()) {
 		const u8 *data = Memory::GetPointerWriteOrException(DS_SOURCE_ADDR);
@@ -801,6 +838,7 @@ void SoftGPU::CheckConfigChanged(const DisplayLayoutConfig &config) {
 		if (presentation_) {
 			presentation_->UpdatePostShader(config);
 		}
+		UpdateComputeBackend();
 		configChanged_ = false;
 	}
 }
@@ -1500,7 +1538,14 @@ static DrawingCoords GetTargetSize(int stride) {
 	return DrawingCoords((s16)w, (s16)h);
 }
 
+// The debug getters read memory: compute rasterization may still have drawing on the GPU (lazy readback).
+void SoftGPU::SyncDebugRead() {
+	if (drawEngine_->transformUnit.ComputeActive())
+		drawEngine_->transformUnit.Flush(this, "debug");
+}
+
 bool SoftGPU::GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferType type, int maxRes) {
+	SyncDebugRead();
 	int stride = gstate.FrameBufStride();
 	DrawingCoords size = GetTargetSize(stride);
 	GEBufferFormat fmt = gstate.FrameBufFormat();
@@ -1540,6 +1585,7 @@ bool SoftGPU::GetOutputFramebuffer(GPUDebugBuffer &buffer) {
 }
 
 bool SoftGPU::GetCurrentDepthbuffer(GPUDebugBuffer &buffer) {
+	SyncDebugRead();
 	DrawingCoords size = GetTargetSize(gstate.DepthBufStride());
 	buffer.Allocate(size.x, size.y, GPU_DBG_FORMAT_16BIT);
 
@@ -1565,6 +1611,7 @@ static inline u8 GetPixelStencil(GEBufferFormat fmt, int fbStride, int x, int y)
 }
 
 bool SoftGPU::GetCurrentStencilbuffer(GPUDebugBuffer &buffer) {
+	SyncDebugRead();
 	DrawingCoords size = GetTargetSize(gstate.FrameBufStride());
 	buffer.Allocate(size.x, size.y, GPU_DBG_FORMAT_8BIT);
 
@@ -1579,11 +1626,13 @@ bool SoftGPU::GetCurrentStencilbuffer(GPUDebugBuffer &buffer) {
 }
 
 bool SoftGPU::GetCurrentTexture(GPUDebugBuffer &buffer, int level, bool *isFramebuffer) {
+	SyncDebugRead();
 	*isFramebuffer = false;
 	return Rasterizer::GetCurrentTexture(buffer, level);
 }
 
 bool SoftGPU::GetCurrentClut(GPUDebugBuffer &buffer) {
+	SyncDebugRead();
 	const u32 bpp = gstate.getClutPaletteFormat() == GE_CMODE_32BIT_ABGR8888 ? 4 : 2;
 	const u32 pixels = 1024 / bpp;
 

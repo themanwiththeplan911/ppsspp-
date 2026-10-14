@@ -176,6 +176,13 @@ static ParseParamResult ParseParameterStr(int argc, const char *argv[], size_t &
 	return ParseParamResult::NoMatch;
 }
 
+// Enum for Config::iSoftwareComputeVariants
+const char *g_SoftwareComputeVariantsValues[] = {
+	"async",
+	"sync",
+	"off",
+};
+
 // Enum ExceptionAction
 const char *g_ExceptionActionValues[] = {
 	"default",
@@ -200,6 +207,9 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(compare), CmdParamType::Bool, "compare", 'c', "Enable comparison mode", CmdLineMode::Headless},
 	{POFF(bench), CmdParamType::Bool, "bench", 'b', "Enable benchmark mode", CmdLineMode::Headless},
 	{POFF(oldAtrac), CmdParamType::Bool, "old-atrac", '\0', "Use old ATRAC decoder"},
+	{POFF(softwareCpuRaster), CmdParamType::Bool, "soft-cpu-raster", '\0', "With the software renderer on Vulkan, rasterize on the CPU instead of with compute shaders"},
+	{POFF(softwareComputeLazy), CmdParamType::Bool, "soft-compute-lazy", '\0', "With compute rasterization, copy drawing back to memory only when needed, not at every sync and frame"},
+	{POFF(softwareComputeVariants), CmdParamType::Enum, "soft-compute-variants", '\0', "Specialized compute shaders: compiled in the background, waited for, or off", CmdLineMode::Both, g_SoftwareComputeVariantsValues, ARRAY_SIZE(g_SoftwareComputeVariantsValues)},
 	{POFF(log), CmdParamType::String, "log", '\0', "Output log to FILE", CmdLineMode::Application},
 	{POFF(enableLogging), CmdParamType::Bool, "log", '\0', "Full log output, not just emulated printfs", CmdLineMode::Headless},
 	{POFF(screenshotFilename), CmdParamType::String, "screenshot", '\0', "Compare rendered output against a reference screenshot FILE", CmdLineMode::Headless},
@@ -334,7 +344,7 @@ int CommandLineOptions::PrintUsage(const char *progname, const char *situationTe
 	}
 
 	PRINT_STDOUT("  --graphics=BACKEND    use a different gpu backend\n");
-	PRINT_STDOUT("                        options: gles, software, etc. (also opengl3.1, etc.)\n");
+	PRINT_STDOUT("                        options: gles, vulkan, software, software-vulkan, etc. (also opengl3.1, etc.)\n");
 	return 0;
 }
 
@@ -457,6 +467,10 @@ CommandLineParseResult CommandLineOptions::Parse(int argc, const char *argv[], C
 			} else if (restOfOption == "software") {
 				gpuBackend = GPUBackend::OPENGL;
 				softwareRendering = true;
+			} else if (restOfOption == "software-vulkan") {
+				// The software renderer, rasterizing with Vulkan compute shaders.
+				gpuBackend = GPUBackend::VULKAN;
+				softwareRendering = true;
 			} else if (sscanf(restOfOption.c_str(), "gles%lg", &glVersionTemp) == 1 || sscanf(restOfOption.c_str(), "opengl%lg", &glVersionTemp) == 1) {
 				gpuBackend = GPUBackend::OPENGL;
 				softwareRendering = false;
@@ -542,6 +556,18 @@ void CommandLineOptions::ApplyToConfig() const {
 	if (softwareRendering.has_value()) {
 		g_Config.bSoftwareRendering = softwareRendering.value();
 		g_Config.DoNotSaveSetting(&g_Config.bSoftwareRendering);
+	}
+	if (softwareCpuRaster.has_value()) {
+		g_Config.bSoftwareRenderingCompute = !softwareCpuRaster.value();
+		g_Config.DoNotSaveSetting(&g_Config.bSoftwareRenderingCompute);
+	}
+	if (softwareComputeLazy.has_value()) {
+		g_Config.bSoftwareComputeLazyReadback = softwareComputeLazy.value();
+		g_Config.DoNotSaveSetting(&g_Config.bSoftwareComputeLazyReadback);
+	}
+	if (softwareComputeVariants.has_value()) {
+		g_Config.iSoftwareComputeVariants = softwareComputeVariants.value();
+		g_Config.DoNotSaveSetting(&g_Config.iSoftwareComputeVariants);
 	}
 	if (enableLogging.has_value()) {
 		g_Config.bEnableLogging = enableLogging.value();

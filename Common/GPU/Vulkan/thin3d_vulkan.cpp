@@ -338,6 +338,9 @@ public:
 		Destroy();
 	}
 
+	VkImage GetImage() {
+		return vkTex_ ? vkTex_->GetImage() : VK_NULL_HANDLE;
+	}
 	VkImageView GetImageView() {
 		if (vkTex_) {
 			return vkTex_->GetImageView();
@@ -2020,6 +2023,8 @@ uint64_t VKContext::GetNativeObject(NativeObject obj, void *srcObject) {
 		return (uint64_t)GetNullTexture()->GetImageArrayView();
 	case NativeObject::TEXTURE_VIEW:
 		return (uint64_t)(((VKTexture *)srcObject)->GetImageView());
+	case NativeObject::TEXTURE_IMAGE:
+		return (uint64_t)(((VKTexture *)srcObject)->GetImage());
 	case NativeObject::BOUND_FRAMEBUFFER_COLOR_IMAGEVIEW_ALL_LAYERS:
 		return (uint64_t)curFramebuffer_->GetFB()->color.texAllLayersView;
 	case NativeObject::BOUND_FRAMEBUFFER_COLOR_IMAGEVIEW_RT:

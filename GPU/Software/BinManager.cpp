@@ -26,10 +26,12 @@
 #include "Common/Thread/ThreadManager.h"
 #include "Common/Data/Text/StringWriter.h"
 #include "Common/TimeUtil.h"
+#include "Core/Config.h"
 #include "Core/MemMap.h"
 #include "Core/System.h"
 #include "GPU/Common/TextureDecoder.h"
 #include "GPU/Software/BinManager.h"
+#include "GPU/Software/ComputeRaster.h"
 #include "GPU/Software/Rasterizer.h"
 #include "GPU/Software/RasterizerRectangle.h"
 #include "GPU/Software/SoftGpu.h"
@@ -176,6 +178,7 @@ BinManager::BinManager() {
 }
 
 BinManager::~BinManager() {
+	delete compute_;
 	delete waitable_;
 	FreeAlignedMemory(tiles_);
 
@@ -203,11 +206,16 @@ void BinManager::PushState() {
 			};
 			stateIndex_ = moved(stateIndex_);
 			pendingStateIndex_ = moved(pendingStateIndex_);
+			computeStates_.clear();
 			INFO_LOG(Log::G3D, "Software: state ring grown to %d", (int)states_.Capacity());
 		}
 	}
 	creatingState_ = true;
 	stateIndex_ = (uint16_t)states_.Push(RasterizerState());
+	if ((size_t)stateIndex_ * 2 + 1 < computeStates_.size()) {
+		computeStates_[stateIndex_ * 2] = ~0ULL;
+		computeStates_[stateIndex_ * 2 + 1] = ~0ULL;
+	}
 	// When new funcs are compiled, we need to flush if WX exclusive. Compiling can also clear the caches,
 	// losing the funcs picked before it, so then compute it again.
 	for (int tries = 0; tries < 3; ++tries) {
@@ -822,7 +830,41 @@ bool BinManager::ProcessTiles(int start) {
 	return any;
 }
 
+// Flushes for these change what the next draws use, but nothing outside drawing looks at memory, so the compute
+// backend can leave what it drew on the GPU until a flush where something does.
+static bool FlushNeedsMemory(const char *reason);
+
+// List syncs and the display: with lazy readback, the GPU keeps what it drew there too, as the hardware
+// renderers do. The display shows it from the GPU (DisplayTexture).
+static bool LazyFlush(const char *reason) {
+	if (!g_Config.bSoftwareComputeLazyReadback)
+		return false;
+	static const char *const lazy[] = { "finish", "listsync", "drawsync", "output" };
+	for (const char *r : lazy) {
+		if (!strcmp(reason, r))
+			return true;
+	}
+	return false;
+}
+
+static bool FlushNeedsMemory(const char *reason) {
+	static const char *const internal[] = { "framebuf", "depthbuf", "translation", "states", "cluts", "compile", "selfdepth" };
+	for (const char *r : internal) {
+		if (!strcmp(reason, r))
+			return false;
+	}
+	return !LazyFlush(reason);
+}
+
 void BinManager::Flush(const char *reason) {
+	if (compute_) {
+		DrainCompute();
+		// The CPU may write to memory after this, where the GPU drew too: check before drawing on.
+		if (LazyFlush(reason))
+			computeCheckCPU_ = true;
+	}
+	if (compute_ && !queuedSinceFlush_ && compute_->AnyGPUWrites() && FlushNeedsMemory(reason))
+		compute_->Flush(true);
 	if (!queuedSinceFlush_) {
 		// Nothing queued, so nothing refers to the older states and CLUTs. Trim them anyway: callers
 		// flush because one of these rings is full, and push into it right after.
@@ -840,14 +882,18 @@ void BinManager::Flush(const char *reason) {
 	if (collectDebugStats) {
 		st = time_now_d();
 	}
-	Drain();
-	if (maxTasks_ > 1 || activeCount_ != 0) {
-		// Help with the drawing, then wait for what the threads are still on.
-		while (ProcessTiles(0)) {
+	if (compute_) {
+		compute_->Flush(FlushNeedsMemory(reason));
+	} else {
+		Drain();
+		if (maxTasks_ > 1 || activeCount_ != 0) {
+			// Help with the drawing, then wait for what the threads are still on.
+			while (ProcessTiles(0)) {
+			}
 		}
+		waitable_->Wait();
+		ResetTiles();
 	}
-	waitable_->Wait();
-	ResetTiles();
 	distributePos_ = 0;
 	undistributed_ = 0;
 	// The CPU and transfers may write memory after a flush.
@@ -860,8 +906,11 @@ void BinManager::Flush(const char *reason) {
 	while (cluts_.Size() > 1)
 		cluts_.SkipNext();
 
-	Rasterizer::FlushJit();
-	Sampler::FlushJit();
+	// The compute backend draws without the JIT, so it doesn't compile what states asked for.
+	if (!compute_) {
+		Rasterizer::FlushJit();
+		Sampler::FlushJit();
+	}
 
 	queuedSinceFlush_ = false;
 
@@ -909,6 +958,9 @@ bool BinManager::HasPendingWrite(uint32_t start, uint32_t stride, uint32_t w, ui
 		return false;
 	// Ignore mirrors for overlap detection.
 	start &= 0x041FFFFF;
+	// What the compute backend drew and hasn't copied back yet.
+	if (compute_ && compute_->HasGPUWrites(start, stride * (h - 1) + w))
+		return true;
 
 	for (const auto &range : pendingWrites_) {
 		if (PendingWriteIn(range, start, stride, w, h))
@@ -965,6 +1017,8 @@ bool BinManager::HasPendingRead(uint32_t start, uint32_t stride, uint32_t w, uin
 }
 
 void BinManager::GetStats(StringWriter &w) {
+	if (compute_)
+		compute_->GetStats(w);
 	double allTotal = 0.0;
 	double slowestTotalTime = 0.0;
 	const char *slowestTotalReason = nullptr;
@@ -1051,6 +1105,10 @@ BinCoords BinManager::Range(const VertexData &v0) {
 // After queuing an item: draw it now, alone, or later in a batch.
 void BinManager::ItemQueued() {
 	queuedSinceFlush_ = true;
+	if (compute_) {
+		ItemQueuedCompute();
+		return;
+	}
 
 	if (maxTasks_ == 1) {
 		Drain();
@@ -1280,4 +1338,183 @@ void BinManager::DrainDependent() {
 	distributePos_ = 0;
 	undistributed_ = 0;
 	ClearTileMarks();
+}
+
+Draw::Texture *BinManager::ComputeDisplayTexture(uint32_t addr, int stride, int format, int width, int height) {
+	if (!compute_ || !queue_.Empty())
+		return nullptr;
+	return compute_->DisplayTexture(addr, stride, format, width, height);
+}
+
+bool BinManager::HasUnreadGPUWrites() const {
+	return compute_ && compute_->AnyGPUWrites();
+}
+
+void BinManager::SetComputeBackend(SoftCompute::Backend *backend) {
+	_dbg_assert_(queue_.Empty() && computePending_.empty());
+	delete compute_;
+	compute_ = backend;
+	computeStates_.clear();
+	selfTexCached_ = false;
+	memset(computeSnapBytes_, 0, sizeof(computeSnapBytes_));
+}
+
+uint32_t BinManager::ComputeState(uint16_t index, bool snapshot) {
+	if (computeStates_.size() < states_.Capacity() * 2)
+		computeStates_.assign(states_.Capacity() * 2, ~0ULL);
+	const uint64_t batch = compute_->BatchId();
+	uint64_t &entry = computeStates_[(size_t)index * 2 + (snapshot ? 1 : 0)];
+	if ((entry >> 32) == batch)
+		return (uint32_t)entry;
+	// The pending items go in the batch their states are in.
+	if (compute_->BatchFull())
+		DrainCompute();
+	const uint32_t packed = compute_->PackState(states_[index], snapshot);
+	entry = ((uint64_t)compute_->BatchId() << 32) | packed;
+	return packed;
+}
+
+// SelfTextureSnapshot's choice, with the copies on the GPU: a texture small enough for the GE's texture cache
+// stays as it was first read until TEXFLUSH, anything else is copied again for each primitive.
+void BinManager::ComputeSelfTextureSnapshot(const RasterizerState &state) {
+	const uint32_t bits = textureBitsPerPixel[state.samplerID.texfmt];
+	uint32_t totalBytes = 0;
+	bool sameTexture = true;
+	for (int i = 0; i <= state.maxTexLevel; ++i) {
+		const uint32_t bytes = state.samplerID.cached.sizes[i].w * bits / 8 * state.samplerID.cached.sizes[i].h;
+		totalBytes += bytes;
+		sameTexture = sameTexture && selfTexAddr_[i] == state.texaddr[i] && computeSnapBytes_[i] == state.texbufw[i] * bits / 8 * state.samplerID.cached.sizes[i].h;
+	}
+	const bool cacheSized = totalBytes <= 8192;
+	if (cacheSized && selfTexCached_ && sameTexture && selfTexFlushGen_ == state.texFlushGen)
+		return;
+	selfTexCached_ = cacheSized;
+	selfTexFlushGen_ = state.texFlushGen;
+
+	compute_->BeginSnapshot();
+	for (int i = 0; i <= state.maxTexLevel; ++i) {
+		const uint32_t bytes = state.texbufw[i] * bits / 8 * state.samplerID.cached.sizes[i].h;
+		if (!state.texptr[i] || !Memory::IsValidRange(state.texaddr[i], bytes))
+			continue;
+		// A depth mirror reads a linear copy made with the state (DeswizzleMirrorTextures), which a snapshot
+		// of would be the same.
+		if (Memory::IsDepthTexVRAMAddress(state.texaddr[i]))
+			continue;
+		compute_->SnapshotLevel(i, state.texaddr[i], bytes);
+		selfTexAddr_[i] = state.texaddr[i];
+		computeSnapBytes_[i] = bytes;
+	}
+}
+
+// ItemQueued with the compute backend: the item goes to the GPU in the segment of primitives drawn together,
+// unless it needs order (NeedsOrder), and then it's drawn alone after everything before it.
+void BinManager::ItemQueuedCompute() {
+	const size_t last = (queue_.tail_ + QUEUED_PRIMS - 1) % QUEUED_PRIMS;
+	const BinItem &item = queue_[last];
+	const RasterizerState &state = states_[item.stateIndex];
+	if (computeCheckCPU_) {
+		computeCheckCPU_ = false;
+		compute_->ResolveCPUWrites();
+	}
+	const bool order = NeedsOrder(item);
+	if (order) {
+		DrainCompute();
+		compute_->EndSegment();
+	}
+	if (item.type == BinItemType::TRIANGLE && TriangleNeedsCPU(item.v0, item.v1, item.v2, state)) {
+		// Rare, so it's simplest to bring memory up to date and draw it here, in order.
+		DrainCompute();
+		compute_->Flush(true);
+		DrawTriangle(item.v0, item.v1, item.v2, item.range, state);
+	} else {
+		const bool snapshot = order && state.selfTexture;
+		if (snapshot)
+			ComputeSelfTextureSnapshot(state);
+		const uint32_t stateIndex = ComputeState(item.stateIndex, snapshot);
+		computePending_.push_back(ComputePending{ item, stateIndex });
+		if (order || computePending_.size() >= 2048)
+			DrainCompute();
+	}
+
+	if (order) {
+		compute_->EndSegment();
+		ClearTileMarks();
+	}
+	queue_.Reset();
+	distributePos_ = 0;
+	undistributed_ = 0;
+}
+
+static bool PackItem(const BinItem &item, const RasterizerState &state, uint32_t stateIndex, SoftCompute::PrimWords &prims) {
+	switch (item.type) {
+	case BinItemType::TRIANGLE:
+		return PackTriangle(item.v0, item.v1, item.v2, item.range, state, stateIndex, prims);
+	case BinItemType::CLEAR_RECT:
+		return PackClearRect(item.v0, item.v1, item.range, state, stateIndex, prims);
+	case BinItemType::RECT:
+		return PackRectangle(item.v0, item.v1, item.range, state, stateIndex, prims);
+	case BinItemType::SPRITE:
+		return PackSprite(item.v0, item.v1, item.range, state, stateIndex, prims);
+	case BinItemType::LINE:
+		return PackLine(item.v0, item.v1, item.range, state, stateIndex, prims);
+	case BinItemType::POINT:
+		return PackPoint(item.v0, item.range, state, stateIndex, prims);
+	}
+	return false;
+}
+
+// Packs the pending items, split between threads, and hands them to the backend in order.
+void BinManager::DrainCompute() {
+	const int count = (int)computePending_.size();
+	if (count == 0)
+		return;
+	// Small chunks, taken in turn, so the threads finish together (the items vary a lot in cost).
+	constexpr int CHUNK_ITEMS = 64;
+	const int chunks = (count + CHUNK_ITEMS - 1) / CHUNK_ITEMS;
+	if ((int)computeChunks_.size() < chunks) {
+		computeChunks_.resize(chunks);
+		for (SoftCompute::PrimWords &words : computeChunks_)
+			words.reserve(16 * 1024);
+	}
+	computeEnds_.resize(count);
+
+	std::atomic<int> nextChunk{ 0 };
+	auto packChunks = [&]() {
+		int c;
+		while ((c = nextChunk.fetch_add(1)) < chunks) {
+			// Packed into a local: the chunks' sizes share cache lines.
+			SoftCompute::PrimWords out = std::move(computeChunks_[c]);
+			out.clear();
+			const int end = std::min(count, (c + 1) * CHUNK_ITEMS);
+			for (int i = c * CHUNK_ITEMS; i < end; ++i) {
+				const ComputePending &p = computePending_[i];
+				const bool added = PackItem(p.item, states_[p.item.stateIndex], p.stateIndex, out);
+				computeEnds_[i] = added ? (uint32_t)out.size() : ~0U;
+			}
+			computeChunks_[c] = std::move(out);
+		}
+	};
+	const int helpers = std::min(chunks - 1, g_threadManager.GetNumLooperThreads());
+	WaitableCounter *waitable = nullptr;
+	if (helpers > 0)
+		waitable = ParallelRangeLoopWaitable(&g_threadManager, [&](int, int) { packChunks(); }, 0, helpers, 1, helpers, TaskPriority::HIGH);
+	packChunks();
+	if (waitable)
+		waitable->WaitAndRelease();
+
+	SoftCompute::PrimWords &prims = compute_->Prims();
+	for (int c = 0; c < chunks; ++c) {
+		const SoftCompute::PrimWords &words = computeChunks_[c];
+		uint32_t start = 0;
+		const int end = std::min(count, (c + 1) * CHUNK_ITEMS);
+		for (int i = c * CHUNK_ITEMS; i < end; ++i) {
+			if (computeEnds_[i] == ~0U)
+				continue;
+			const uint32_t offset = (uint32_t)prims.size();
+			prims.append(words.data() + start, computeEnds_[i] - start);
+			start = computeEnds_[i];
+			compute_->CommitPrim(offset, states_[computePending_[i].item.stateIndex]);
+		}
+	}
+	computePending_.clear();
 }

@@ -141,6 +141,9 @@
     <ClInclude Include="Vulkan\TextureCacheVulkan.h">
       <Filter>Vulkan</Filter>
     </ClInclude>
+    <ClInclude Include="Vulkan\ComputeRasterShader.h">
+      <Filter>Vulkan</Filter>
+    </ClInclude>
     <ClInclude Include="Vulkan\VulkanUtil.h">
       <Filter>Vulkan</Filter>
     </ClInclude>
@@ -235,6 +238,9 @@
       <Filter>Software</Filter>
     </ClInclude>
     <ClInclude Include="Software\BinManager.h">
+      <Filter>Software</Filter>
+    </ClInclude>
+    <ClInclude Include="Software\ComputeRaster.h">
       <Filter>Software</Filter>
     </ClInclude>
     <ClInclude Include="Common\Draw2D.h">
@@ -393,6 +399,9 @@
       <Filter>Vulkan</Filter>
     </ClCompile>
     <ClCompile Include="Vulkan\TextureCacheVulkan.cpp">
+      <Filter>Vulkan</Filter>
+    </ClCompile>
+    <ClCompile Include="Vulkan\ComputeRasterVulkan.cpp">
       <Filter>Vulkan</Filter>
     </ClCompile>
     <ClCompile Include="Vulkan\VulkanUtil.cpp">

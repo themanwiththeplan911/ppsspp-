@@ -1034,6 +1034,7 @@ SOURCES_C += \
     $(EXTDIR)/miniupnp/miniupnpc/src/upnpreplyparse.c
 
 SOURCES_CXX += \
+	$(GPUDIR)/Vulkan/ComputeRasterVulkan.cpp \
 	$(GPUDIR)/Vulkan/DrawEngineVulkan.cpp \
 	$(GPUDIR)/Vulkan/FramebufferManagerVulkan.cpp \
 	$(GPUDIR)/Vulkan/GPU_Vulkan.cpp \

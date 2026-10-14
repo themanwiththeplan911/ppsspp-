@@ -23,6 +23,13 @@
 
 struct BinWaitable;
 class DrawBinItemsTask;
+namespace Draw {
+class Texture;
+}
+namespace SoftCompute {
+class Backend;
+class PrimWords;
+}
 
 enum class BinItemType : uint8_t {
 	TRIANGLE,
@@ -237,6 +244,17 @@ public:
 	void GetStats(StringWriter &w);
 	void ResetStats();
 
+	// Draws with compute shaders instead of the threads (ComputeRaster.h). Takes ownership; null goes back to
+	// the threads. Call with nothing queued.
+	void SetComputeBackend(SoftCompute::Backend *backend);
+	bool ComputeActive() const {
+		return compute_ != nullptr;
+	}
+	// The compute backend drew to memory that hasn't been copied back yet, and a flush will.
+	bool HasUnreadGPUWrites() const;
+	// The display from the compute backend (Backend::DisplayTexture), with nothing queued.
+	Draw::Texture *ComputeDisplayTexture(uint32_t addr, int stride, int format, int width, int height);
+
 	void SetDirty(SoftDirty flags) {
 		dirty_ |= flags;
 	}
@@ -403,6 +421,29 @@ private:
 	void WakeTasks();
 	void WakeChained();
 	bool ProcessTiles(int start);
+
+	// The compute backend's way of drawing a queued item, instead of the threads.
+	void ItemQueuedCompute();
+	uint32_t ComputeState(uint16_t index, bool snapshot);
+	void ComputeSelfTextureSnapshot(const Rasterizer::RasterizerState &state);
+	void DrainCompute();
+	SoftCompute::Backend *compute_ = nullptr;
+	// Items waiting to be packed, in parallel, and committed in order (DrainCompute).
+	struct ComputePending {
+		BinItem item;
+		uint32_t stateIndex;
+	};
+	std::vector<ComputePending> computePending_;
+	std::vector<SoftCompute::PrimWords> computeChunks_;
+	// Per pending item, where its words end in its chunk, or ~0 if it drew nothing.
+	std::vector<uint32_t> computeEnds_;
+	// A lazy flush left drawing on the GPU, and the CPU may have run since (ResolveCPUWrites).
+	bool computeCheckCPU_ = false;
+	// For each state in the ring (twice: without and with a texture snapshot), its index in the backend's
+	// batch, with the batch's id in the upper 32 bits.
+	std::vector<uint64_t> computeStates_;
+	// The texture snapshot the backend has for self-texturing, as SelfTextureSnapshot keeps it.
+	uint32_t computeSnapBytes_[8]{};
 
 	friend class DrawBinItemsTask;
 };

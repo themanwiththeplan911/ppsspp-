@@ -1176,12 +1176,25 @@ void TransformUnit::SendTriangle(CullType cullType, const ClipVertexData *verts,
 }
 
 void TransformUnit::Flush(GPUCommon *common, const char *reason) {
-	if (!hasDraws_)
+	if (!hasDraws_ && !binner_->HasUnreadGPUWrites())
 		return;
 
 	binner_->Flush(reason);
 	common->NotifyFlush();
 	hasDraws_ = false;
+}
+
+void TransformUnit::SetComputeBackend(GPUCommon *common, SoftCompute::Backend *backend) {
+	Flush(common, "backend");
+	binner_->SetComputeBackend(backend);
+}
+
+bool TransformUnit::ComputeActive() const {
+	return binner_->ComputeActive();
+}
+
+Draw::Texture *TransformUnit::ComputeDisplayTexture(uint32_t addr, int stride, int format, int width, int height) {
+	return binner_->ComputeDisplayTexture(addr, stride, format, width, height);
 }
 
 void TransformUnit::GetStats(StringWriter &w) {
@@ -1190,7 +1203,7 @@ void TransformUnit::GetStats(StringWriter &w) {
 }
 
 void TransformUnit::FlushIfOverlap(GPUCommon *common, const char *reason, bool modifying, uint32_t addr, uint32_t stride, uint32_t w, uint32_t h) {
-	if (!hasDraws_)
+	if (!hasDraws_ && !binner_->HasUnreadGPUWrites())
 		return;
 
 	if (binner_->HasPendingWrite(addr, stride, w, h))

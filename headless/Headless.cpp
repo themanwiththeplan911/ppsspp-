@@ -967,6 +967,9 @@ int main(int argc, const char* argv[]) {
 	// under Mesa llvmpipe on Linux/WSL.
 	g_Config.bSoftwareRendering = cmdLineOptions.softwareRendering.value_or(true);
 	g_Config.bSoftwareRenderingJit = true;
+	g_Config.bSoftwareRenderingCompute = !cmdLineOptions.softwareCpuRaster.value_or(false);
+	// Tests read back what was drawn after syncs, as on hardware.
+	g_Config.bSoftwareComputeLazyReadback = cmdLineOptions.softwareComputeLazy.value_or(false);
 	g_Config.iSplineBezierQuality = 2;
 	g_Config.bHighQualityDepth = true;
 	g_Config.bMemStickInserted = true;
@@ -1026,27 +1029,30 @@ int main(int argc, const char* argv[]) {
 	std::string *deviceSetting = nullptr;
 	void *window = nullptr;
 	WindowDesc windowDesc;
-	if (g_Config.bSoftwareRendering) {
+	// The software renderer on Vulkan (--graphics=software-vulkan) rasterizes with compute shaders.
+	const bool softwareVulkan = g_Config.bSoftwareRendering && (GPUBackend)g_Config.iGPUBackend == GPUBackend::VULKAN;
+	if (g_Config.bSoftwareRendering && !softwareVulkan) {
 		// For software rendering, we just create a dummy graphics context (to share as much code as possible).
 		// We don't bother with a window.
 		graphicsContext = new NullGraphicsContext();
+	} else if (gpuCore == GPUCORE_VULKAN || softwareVulkan) {
+		// Vulkan renders into images of its own, with no window or swapchain.
+		VulkanGraphicsContext *vulkanContext = new VulkanGraphicsContext();
+		vulkanContext->SetOffscreen(480, 272);
+		graphicsContext = vulkanContext;
+		deviceSetting = &g_Config.sVulkanDevice;
 	} else {
 #if PPSSPP_PLATFORM(ANDROID) || defined(HEADLESS_NO_SDL)
 		fprintf(stderr, "Headless graphics context creation is not supported on this platform.\n");
 		return 1;
 #else
-		if (gpuCore == GPUCORE_VULKAN) {
-			// Vulkan renders into images of its own, with no window or swapchain.
-			VulkanGraphicsContext *vulkanContext = new VulkanGraphicsContext();
-			vulkanContext->SetOffscreen(480, 272);
-			graphicsContext = vulkanContext;
-			deviceSetting = &g_Config.sVulkanDevice;
 #if PPSSPP_PLATFORM(MAC) && defined(SDL)
-		} else if (gpuCore == GPUCORE_GLES) {
-			// So does OpenGL, into a framebuffer object of its own.
+		if (gpuCore == GPUCORE_GLES) {
+			// Like Vulkan, OpenGL renders into a framebuffer object of its own.
 			graphicsContext = new CGLHeadlessGraphicsContext(480, 272);
+		} else
 #endif
-		} else {
+		{
 			// TODO: Will we need a larger window for higher resolutions? Well, not if we use buffered rendering.
 			window = CreateHiddenWindow(480, 272, cmdLineOptions.gpuBackend.value_or(GPUBackend::OPENGL), &windowDesc);
 			if (!windowDesc.Valid()) {

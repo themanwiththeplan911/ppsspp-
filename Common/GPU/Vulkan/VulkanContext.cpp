@@ -827,6 +827,8 @@ VkResult VulkanContext::CreateDevice(int physical_device, const std::vector<cons
 	deviceFeatures_.enabled.standard.shaderClipDistance = deviceFeatures_.available.standard.shaderClipDistance;
 	deviceFeatures_.enabled.standard.shaderCullDistance = deviceFeatures_.available.standard.shaderCullDistance;
 	deviceFeatures_.enabled.standard.sampleRateShading = deviceFeatures_.available.standard.sampleRateShading;
+	// The software renderer's compute rasterizer needs it.
+	deviceFeatures_.enabled.standard.shaderInt64 = deviceFeatures_.available.standard.shaderInt64;
 
 	// A host application (e.g. a libretro frontend) may require some additional features to be enabled.
 	if (extraRequiredFeatures) {
