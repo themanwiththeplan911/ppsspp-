@@ -1193,6 +1193,10 @@ bool TransformUnit::ComputeActive() const {
 	return binner_->ComputeActive();
 }
 
+Draw::Texture *TransformUnit::ComputeDisplayTexture(uint32_t addr, int stride, int format, int width, int height) {
+	return binner_->ComputeDisplayTexture(addr, stride, format, width, height);
+}
+
 void TransformUnit::GetStats(StringWriter &w) {
 	// TODO: More stats?
 	binner_->GetStats(w);

@@ -56,6 +56,69 @@ static constexpr uint32_t MIRROR_PAGE_SIZE = 1 << MIRROR_PAGE_SHIFT;
 // Self-texturing snapshots, and data from the CPU (CLUTs, textures that aren't in PSP memory).
 static constexpr uint32_t SNAPSHOT_SIZE = 4 * 1024 * 1024;
 static constexpr uint32_t SCRATCH_SIZE = 8 * 1024 * 1024;
+// The display, converted to RGBA8 for DisplayTexture.
+static constexpr uint32_t DISPLAY_MAX_W = 512;
+static constexpr uint32_t DISPLAY_MAX_H = 512;
+static constexpr uint32_t DISPLAY_SIZE = DISPLAY_MAX_W * DISPLAY_MAX_H * 4;
+
+// Converts a framebuffer in the memory buffer to RGBA8 rows, as SoftGPU's ConvertTextureDescFrom16 does.
+static const char *const displayShader = R"(#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) buffer MemBuf {
+	uint mem[];
+};
+layout(push_constant) uniform Params {
+	uint addr;
+	uint stride;
+	uint format;
+	uint width;
+	uint height;
+	uint outOffset;
+	uint unused;
+} pc;
+
+uint RGB565ToRGBA8888(uint src) {
+	const uint darkRB = ((src & 0x1Fu) << 3) | ((src & 0xF800u) << 8);
+	const uint fullRB = darkRB | ((darkRB >> 5) & 0x070007u);
+	const uint darkG = (src & 0x7E0u) << 5;
+	const uint fullG = darkG | ((darkG >> 6) & 0x300u);
+	return fullRB | fullG | 0xFF000000u;
+}
+
+uint RGBA5551ToRGBA8888(uint src) {
+	const uint dark = ((src & 0x1Fu) << 3) | ((src & 0x3E0u) << 6) | ((src & 0x7C00u) << 9);
+	uint full = dark | ((dark >> 5) & 0x070707u);
+	if ((src >> 15) != 0u)
+		full |= 0xFF000000u;
+	return full;
+}
+
+uint RGBA4444ToRGBA8888(uint src) {
+	const uint c = (src & 0xFu) | ((src & 0xF0u) << 4) | ((src & 0xF00u) << 8) | ((src & 0xF000u) << 12);
+	return c | (c << 4);
+}
+
+void main() {
+	const uint x = gl_GlobalInvocationID.x;
+	const uint y = gl_GlobalInvocationID.y;
+	if (x >= pc.width || y >= pc.height)
+		return;
+	uint color;
+	if (pc.format == 3u) {
+		color = mem[((pc.addr + (y * pc.stride + x) * 4u) & 0x1FFFFFu) >> 2];
+	} else {
+		const uint a = (pc.addr + (y * pc.stride + x) * 2u) & 0x1FFFFFu;
+		const uint v = (mem[a >> 2] >> ((a & 2u) << 3)) & 0xFFFFu;
+		if (pc.format == 0u)
+			color = RGB565ToRGBA8888(v);
+		else if (pc.format == 1u)
+			color = RGBA5551ToRGBA8888(v);
+		else
+			color = RGBA4444ToRGBA8888(v);
+	}
+	mem[(pc.outOffset >> 2) + y * pc.width + x] = color;
+}
+)";
 // A depth buffer's layout moves bytes within 64 KB (GPU/Common/DepthSwizzle.h), so its pages are tracked by that.
 static constexpr uint32_t DEPTH_BLOCK = 64 * 1024;
 static constexpr int TILE_SHIFT = 4;
@@ -184,6 +247,8 @@ public:
 	void SnapshotLevel(int level, uint32_t addr, uint32_t bytes) override;
 	void Flush(bool readback) override;
 	bool HasGPUWrites(uint32_t addr, uint32_t bytes) const override;
+	void ResolveCPUWrites() override;
+	Draw::Texture *DisplayTexture(uint32_t addr, int stride, int format, int width, int height) override;
 	bool AnyGPUWrites() const override {
 		return anyGPUDirty_;
 	}
@@ -235,6 +300,8 @@ private:
 	VkPipeline CreateVariant(uint32_t mask);
 	VkPipeline Variant(uint32_t mask);
 	void CompileThread();
+	bool CPUChangedGPUPages(uint32_t vramOffset, uint32_t bytes) const;
+	void ReadQueries(int frame);
 	void ResetBatch();
 	template <typename F>
 	void ForPrimTiles(uint32_t off, F f);
@@ -246,8 +313,10 @@ private:
 	uint32_t HostData(const void *src, uint32_t bytes, uint32_t padTo);
 	void ResolveLevel(const Rasterizer::RasterizerState &state, int level, bool snapshot, uint32_t *out);
 
+	Draw::DrawContext *draw_ = nullptr;
 	VulkanContext *vulkan_ = nullptr;
 	VulkanRenderManager *renderManager_ = nullptr;
+	VkPipeline displayPipeline_ = VK_NULL_HANDLE;
 
 	VkDescriptorSetLayout descSetLayout_ = VK_NULL_HANDLE;
 	VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
@@ -280,6 +349,7 @@ private:
 	uint32_t ramOffset_ = 0;
 	uint32_t snapshotOffset_ = 0;
 	uint32_t scratchOffset_ = 0;
+	uint32_t displayOffset_ = 0;
 	uint32_t memBytes_ = 0;
 
 	// What the GPU's copy of VRAM and RAM holds (or will, after the uploads queued), at the same offsets.
@@ -333,13 +403,15 @@ private:
 	size_t statReadbackBytes_ = 0;
 	double statSyncTime_ = 0.0;
 	// GPU time of the batches, from timestamps around each (read at the next readback).
-	VkQueryPool queryPool_ = VK_NULL_HANDLE;
-	uint32_t queriesUsed_ = 0;
+	// Per frame in flight: a frame's are read when it comes around again (or at a readback), done by then.
+	VkQueryPool queryPool_[VulkanContext::MAX_INFLIGHT_FRAMES]{};
+	uint32_t queriesUsed_[VulkanContext::MAX_INFLIGHT_FRAMES]{};
+	int queryFrame_ = -1;
 	double statGPUTime_ = 0.0;
 	double timestampPeriod_ = 0.0;
 };
 
-ComputeRasterVulkan::ComputeRasterVulkan(Draw::DrawContext *draw) {
+ComputeRasterVulkan::ComputeRasterVulkan(Draw::DrawContext *draw) : draw_(draw) {
 	vulkan_ = (VulkanContext *)draw->GetNativeObject(Draw::NativeObject::CONTEXT);
 	renderManager_ = (VulkanRenderManager *)draw->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
 }
@@ -385,7 +457,8 @@ bool ComputeRasterVulkan::Init() {
 	ramOffset_ = MEM_RAM_OFFSET;
 	snapshotOffset_ = ramOffset_ + ramSize_;
 	scratchOffset_ = snapshotOffset_ + SNAPSHOT_SIZE;
-	memBytes_ = scratchOffset_ + SCRATCH_SIZE;
+	displayOffset_ = scratchOffset_ + SCRATCH_SIZE;
+	memBytes_ = displayOffset_ + DISPLAY_SIZE;
 	if (vulkan_->GetPhysicalDeviceProperties().properties.limits.maxStorageBufferRange < memBytes_) {
 		WARN_LOG(Log::G3D, "Software compute: storage buffers too small");
 		return false;
@@ -431,6 +504,20 @@ bool ComputeRasterVulkan::Init() {
 	pipeline_ = CreateVariant(SPEC_ALL);
 	if (pipeline_ == VK_NULL_HANDLE)
 		return false;
+	VkShaderModule displayModule = CompileShaderModule(vulkan_, VK_SHADER_STAGE_COMPUTE_BIT, displayShader, &error);
+	if (displayModule) {
+		VkComputePipelineCreateInfo pci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+		pci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		pci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		pci.stage.module = displayModule;
+		pci.stage.pName = "main";
+		pci.layout = pipelineLayout_;
+		if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pci, nullptr, &displayPipeline_) != VK_SUCCESS)
+			displayPipeline_ = VK_NULL_HANDLE;
+		vulkan_->Delete().QueueDeleteShaderModule(displayModule);
+	} else {
+		WARN_LOG(Log::G3D, "Software compute: display shader failed to compile: %s", error.c_str());
+	}
 	variantMode_ = g_Config.iSoftwareComputeVariants;
 	if (variantMode_ == 0)
 		compileThread_ = std::thread([this] { CompileThread(); });
@@ -441,8 +528,10 @@ bool ComputeRasterVulkan::Init() {
 		VkQueryPoolCreateInfo qp{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
 		qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
 		qp.queryCount = MAX_QUERIES;
-		if (vkCreateQueryPool(device, &qp, nullptr, &queryPool_) != VK_SUCCESS)
-			queryPool_ = VK_NULL_HANDLE;
+		for (VkQueryPool &pool : queryPool_) {
+			if (vkCreateQueryPool(device, &qp, nullptr, &pool) != VK_SUCCESS)
+				pool = VK_NULL_HANDLE;
+		}
 		timestampPeriod_ = vulkan_->GetPhysicalDeviceProperties().properties.limits.timestampPeriod * 1e-9;
 	}
 
@@ -486,6 +575,8 @@ ComputeRasterVulkan::~ComputeRasterVulkan() {
 		vulkan_->Delete().QueueDeletePipeline(it.second);
 	if (pipeline_ != VK_NULL_HANDLE)
 		vulkan_->Delete().QueueDeletePipeline(pipeline_);
+	if (displayPipeline_ != VK_NULL_HANDLE)
+		vulkan_->Delete().QueueDeletePipeline(displayPipeline_);
 	if (module_ != VK_NULL_HANDLE)
 		vulkan_->Delete().QueueDeleteShaderModule(module_);
 	if (pipelineLayout_ != VK_NULL_HANDLE)
@@ -494,8 +585,10 @@ ComputeRasterVulkan::~ComputeRasterVulkan() {
 		vulkan_->Delete().QueueDeleteDescriptorSetLayout(descSetLayout_);
 	if (descPool_ != VK_NULL_HANDLE)
 		vulkan_->Delete().QueueDeleteDescriptorPool(descPool_);
-	if (queryPool_ != VK_NULL_HANDLE)
-		vulkan_->Delete().QueueDeleteQueryPool(queryPool_);
+	for (VkQueryPool pool : queryPool_) {
+		if (pool != VK_NULL_HANDLE)
+			vulkan_->Delete().QueueDeleteQueryPool(pool);
+	}
 }
 
 // The set binds whole buffers, so it changes when one does. Sets already recorded are left alone (the GPU may
@@ -1239,10 +1332,17 @@ void ComputeRasterVulkan::Submit() {
 	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
 	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-	const bool timed = queryPool_ != VK_NULL_HANDLE && queriesUsed_ + 2 <= MAX_QUERIES;
+	const int frame = vulkan_->GetCurFrame();
+	if (frame != queryFrame_) {
+		ReadQueries(frame);
+		queryFrame_ = frame;
+	}
+	VkQueryPool pool = queryPool_[frame];
+	uint32_t &queries = queriesUsed_[frame];
+	const bool timed = pool != VK_NULL_HANDLE && queries + 2 <= MAX_QUERIES;
 	if (timed) {
-		vkCmdResetQueryPool(cmd, queryPool_, queriesUsed_, 2);
-		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, queriesUsed_);
+		vkCmdResetQueryPool(cmd, pool, queries, 2);
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, queries);
 	}
 	VkPipeline bound = VK_NULL_HANDLE;
 	for (const Op &op : ops_) {
@@ -1273,8 +1373,8 @@ void ComputeRasterVulkan::Submit() {
 	}
 
 	if (timed) {
-		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool_, queriesUsed_ + 1);
-		queriesUsed_ += 2;
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, queries + 1);
+		queries += 2;
 	}
 	statBatches_++;
 	ResetBatch();
@@ -1328,14 +1428,7 @@ void ComputeRasterVulkan::Flush(bool readback) {
 		renderManager_->SyncInitCommands();
 		statSyncTime_ += time_now_d() - start;
 		vmaInvalidateAllocation(vulkan_->Allocator(), readback_.alloc, 0, VK_WHOLE_SIZE);
-		if (queriesUsed_ != 0) {
-			uint64_t stamps[MAX_QUERIES];
-			if (vkGetQueryPoolResults(vulkan_->GetDevice(), queryPool_, 0, queriesUsed_, sizeof(stamps), stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-				for (uint32_t i = 0; i < queriesUsed_; i += 2)
-					statGPUTime_ += (double)(stamps[i + 1] - stamps[i]) * timestampPeriod_;
-			}
-			queriesUsed_ = 0;
-		}
+		ReadQueries(vulkan_->GetCurFrame());
 
 		// Only what the GPU changed goes to memory: the CPU may have written elsewhere in these pages since, and
 		// then the shadow keeps the GPU's old bytes, so the next upload sends the CPU's.
@@ -1371,6 +1464,112 @@ void ComputeRasterVulkan::Flush(bool readback) {
 	// The CPU may change memory now, so check again what's read next.
 	std::fill(verified_.begin(), verified_.end(), 0);
 	verifyGen_++;
+}
+
+// Whether the CPU wrote to a page the GPU drew to and hasn't copied back (the shadow is what both had then).
+bool ComputeRasterVulkan::CPUChangedGPUPages(uint32_t vramOffset, uint32_t bytes) const {
+	if (!anyGPUDirty_ || bytes == 0)
+		return false;
+	const uint8_t *vram = Memory::GetPointerUnchecked(0x04000000);
+	const uint32_t first = vramOffset >> MIRROR_PAGE_SHIFT;
+	const uint32_t last = std::min(vramOffset + bytes - 1, MEM_VRAM_SIZE - 1) >> MIRROR_PAGE_SHIFT;
+	for (uint32_t page = first; page <= last; ++page) {
+		if (!(gpuDirty_[page >> 5] & (1U << (page & 31))))
+			continue;
+		const uint32_t offset = page << MIRROR_PAGE_SHIFT;
+		if (memcmp(vram + offset, shadow_.data() + offset, MIRROR_PAGE_SIZE) != 0)
+			return true;
+	}
+	return false;
+}
+
+void ComputeRasterVulkan::ResolveCPUWrites() {
+	if (CPUChangedGPUPages(0, MEM_VRAM_SIZE))
+		Flush(true);
+}
+
+Draw::Texture *ComputeRasterVulkan::DisplayTexture(uint32_t addr, int stride, int format, int width, int height) {
+	if (displayPipeline_ == VK_NULL_HANDLE || !Memory::IsVRAMAddress(addr) || stride <= 0 || width <= 0 || height <= 0)
+		return nullptr;
+	if ((uint32_t)width > DISPLAY_MAX_W || (uint32_t)height > DISPLAY_MAX_H)
+		return nullptr;
+	const uint32_t bpp = format == GE_FORMAT_8888 ? 4 : 2;
+	const uint32_t start = addr & (MEM_VRAM_SIZE - 1);
+	const uint32_t bytes = ((uint32_t)stride * (height - 1) + width) * bpp;
+	if (start + bytes > MEM_VRAM_SIZE || !HasGPUWrites(start, bytes))
+		return nullptr;
+	if (CPUChangedGPUPages(start, bytes)) {
+		// Both drew to it: memory gets the GPU's part and keeps the CPU's.
+		Flush(true);
+		return nullptr;
+	}
+	// The pages the GPU didn't draw to may have changed on the CPU.
+	VerifyVRAM(start, bytes);
+	Submit();
+
+	Draw::TextureDesc desc{};
+	desc.type = Draw::TextureType::LINEAR2D;
+	desc.format = Draw::DataFormat::R8G8B8A8_UNORM;
+	desc.width = width;
+	desc.height = height;
+	desc.depth = 1;
+	desc.mipLevels = 1;
+	desc.tag = "SoftCompute display";
+	Draw::Texture *tex = draw_->CreateTexture(desc);
+	if (!tex)
+		return nullptr;
+	const VkImage image = (VkImage)draw_->GetNativeObject(Draw::NativeObject::TEXTURE_IMAGE, tex);
+
+	VkCommandBuffer cmd = renderManager_->GetInitCmd();
+	VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, displayPipeline_);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &descSet_, 0, nullptr);
+	PushParams params{ start, (uint32_t)stride, (uint32_t)format, (uint32_t)width, (uint32_t)height, displayOffset_, 0 };
+	vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), &params);
+	vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	VkImageMemoryBarrier toDst{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+	toDst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	toDst.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toDst.image = image;
+	toDst.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 1, &toDst);
+
+	VkBufferImageCopy copy{};
+	copy.bufferOffset = displayOffset_;
+	copy.bufferRowLength = width;
+	copy.bufferImageHeight = height;
+	copy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+	copy.imageExtent = { (uint32_t)width, (uint32_t)height, 1 };
+	vkCmdCopyBufferToImage(cmd, mem_.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+	VkImageMemoryBarrier toRead = toDst;
+	toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRead);
+	return tex;
+}
+
+void ComputeRasterVulkan::ReadQueries(int frame) {
+	if (queryPool_[frame] == VK_NULL_HANDLE || queriesUsed_[frame] == 0)
+		return;
+	uint64_t stamps[MAX_QUERIES];
+	if (vkGetQueryPoolResults(vulkan_->GetDevice(), queryPool_[frame], 0, queriesUsed_[frame], sizeof(stamps), stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+		for (uint32_t i = 0; i < queriesUsed_[frame]; i += 2)
+			statGPUTime_ += (double)(stamps[i + 1] - stamps[i]) * timestampPeriod_;
+	}
+	queriesUsed_[frame] = 0;
 }
 
 void ComputeRasterVulkan::GetStats(StringWriter &w) {

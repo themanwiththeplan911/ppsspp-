@@ -23,6 +23,9 @@
 
 struct BinWaitable;
 class DrawBinItemsTask;
+namespace Draw {
+class Texture;
+}
 namespace SoftCompute {
 class Backend;
 class PrimWords;
@@ -249,6 +252,8 @@ public:
 	}
 	// The compute backend drew to memory that hasn't been copied back yet, and a flush will.
 	bool HasUnreadGPUWrites() const;
+	// The display from the compute backend (Backend::DisplayTexture), with nothing queued.
+	Draw::Texture *ComputeDisplayTexture(uint32_t addr, int stride, int format, int width, int height);
 
 	void SetDirty(SoftDirty flags) {
 		dirty_ |= flags;
@@ -432,6 +437,8 @@ private:
 	std::vector<SoftCompute::PrimWords> computeChunks_;
 	// Per pending item, where its words end in its chunk, or ~0 if it drew nothing.
 	std::vector<uint32_t> computeEnds_;
+	// A lazy flush left drawing on the GPU, and the CPU may have run since (ResolveCPUWrites).
+	bool computeCheckCPU_ = false;
 	// For each state in the ring (twice: without and with a texture snapshot), its index in the backend's
 	// batch, with the batch's id in the upper 32 bits.
 	std::vector<uint64_t> computeStates_;

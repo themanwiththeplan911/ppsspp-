@@ -31,6 +31,9 @@
 #include <vector>
 
 class StringWriter;
+namespace Draw {
+class Texture;
+}
 struct VertexData;
 struct BinCoords;
 namespace Rasterizer {
@@ -307,6 +310,12 @@ public:
 	// Whether it drew to any of these bytes of VRAM without copying them back yet.
 	virtual bool HasGPUWrites(uint32_t addr, uint32_t bytes) const = 0;
 	virtual bool AnyGPUWrites() const = 0;
+	// Copies back what the GPU drew if the CPU wrote to the same pages since (with lazy readback, which leaves
+	// it on the GPU at syncs).
+	virtual void ResolveCPUWrites() = 0;
+	// The display framebuffer as an RGBA8 texture, converted on the GPU, when the GPU has the latest of it.
+	// Null when PSP memory has it: then that's what to show.
+	virtual Draw::Texture *DisplayTexture(uint32_t addr, int stride, int format, int width, int height) = 0;
 	virtual void GetStats(StringWriter &w) {}
 };
 

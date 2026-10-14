@@ -244,6 +244,7 @@ protected:
 	void FastRunLoop(DisplayList &list) override;
 	void CopyToCurrentFboFromDisplayRam(const DisplayLayoutConfig &config, int srcwidth, int srcheight);
 	void ConvertTextureDescFrom16(Draw::TextureDesc &desc, int srcwidth, int srcheight, const uint16_t *overrideData = nullptr);
+	void SyncDebugRead();
 	bool DarkStalkersStretchActive() const;
 	void UpdateComputeBackend();
 	void GetDarkStalkersDisplay(GPUDebugBuffer &buffer);

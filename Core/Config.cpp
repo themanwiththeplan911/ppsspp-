@@ -701,6 +701,7 @@ static const ConfigSetting graphicsSettings[] = {
 	ConfigSetting("SoftwareRendererJit", SETTING(g_Config, bSoftwareRenderingJit), true, CfgFlag::PER_GAME),
 	ConfigSetting("SoftwareRendererCompute", SETTING(g_Config, bSoftwareRenderingCompute), true, CfgFlag::PER_GAME),
 	ConfigSetting("SoftwareComputeVariants", SETTING(g_Config, iSoftwareComputeVariants), 0, CfgFlag::DEFAULT),
+	ConfigSetting("SoftwareComputeLazyReadback", SETTING(g_Config, bSoftwareComputeLazyReadback), true, CfgFlag::PER_GAME),
 	ConfigSetting("HardwareTransform", SETTING(g_Config, bHardwareTransform), true, CfgFlag::PER_GAME | CfgFlag::REPORT),
 	ConfigSetting("TextureFiltering", SETTING(g_Config, iTexFiltering), 1, CfgFlag::PER_GAME | CfgFlag::REPORT),
 	ConfigSetting("Smart2DTexFiltering", SETTING(g_Config, bSmart2DTexFiltering), false, CfgFlag::PER_GAME | CfgFlag::REPORT),

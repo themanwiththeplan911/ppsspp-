@@ -26,6 +26,7 @@
 #include "Common/Thread/ThreadManager.h"
 #include "Common/Data/Text/StringWriter.h"
 #include "Common/TimeUtil.h"
+#include "Core/Config.h"
 #include "Core/MemMap.h"
 #include "Core/System.h"
 #include "GPU/Common/TextureDecoder.h"
@@ -831,18 +832,37 @@ bool BinManager::ProcessTiles(int start) {
 
 // Flushes for these change what the next draws use, but nothing outside drawing looks at memory, so the compute
 // backend can leave what it drew on the GPU until a flush where something does.
+static bool FlushNeedsMemory(const char *reason);
+
+// List syncs and the display: with lazy readback, the GPU keeps what it drew there too, as the hardware
+// renderers do. The display shows it from the GPU (DisplayTexture).
+static bool LazyFlush(const char *reason) {
+	if (!g_Config.bSoftwareComputeLazyReadback)
+		return false;
+	static const char *const lazy[] = { "finish", "listsync", "drawsync", "output" };
+	for (const char *r : lazy) {
+		if (!strcmp(reason, r))
+			return true;
+	}
+	return false;
+}
+
 static bool FlushNeedsMemory(const char *reason) {
 	static const char *const internal[] = { "framebuf", "depthbuf", "translation", "states", "cluts", "compile", "selfdepth" };
 	for (const char *r : internal) {
 		if (!strcmp(reason, r))
 			return false;
 	}
-	return true;
+	return !LazyFlush(reason);
 }
 
 void BinManager::Flush(const char *reason) {
-	if (compute_)
+	if (compute_) {
 		DrainCompute();
+		// The CPU may write to memory after this, where the GPU drew too: check before drawing on.
+		if (LazyFlush(reason))
+			computeCheckCPU_ = true;
+	}
 	if (compute_ && !queuedSinceFlush_ && compute_->AnyGPUWrites() && FlushNeedsMemory(reason))
 		compute_->Flush(true);
 	if (!queuedSinceFlush_) {
@@ -1320,6 +1340,12 @@ void BinManager::DrainDependent() {
 	ClearTileMarks();
 }
 
+Draw::Texture *BinManager::ComputeDisplayTexture(uint32_t addr, int stride, int format, int width, int height) {
+	if (!compute_ || !queue_.Empty())
+		return nullptr;
+	return compute_->DisplayTexture(addr, stride, format, width, height);
+}
+
 bool BinManager::HasUnreadGPUWrites() const {
 	return compute_ && compute_->AnyGPUWrites();
 }
@@ -1386,6 +1412,10 @@ void BinManager::ItemQueuedCompute() {
 	const size_t last = (queue_.tail_ + QUEUED_PRIMS - 1) % QUEUED_PRIMS;
 	const BinItem &item = queue_[last];
 	const RasterizerState &state = states_[item.stateIndex];
+	if (computeCheckCPU_) {
+		computeCheckCPU_ = false;
+		compute_->ResolveCPUWrites();
+	}
 	const bool order = NeedsOrder(item);
 	if (order) {
 		DrainCompute();

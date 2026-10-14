@@ -151,6 +151,7 @@ public:
 	// Rasterizes with compute shaders (ComputeRaster.h), or with null on the CPU again. Takes ownership.
 	void SetComputeBackend(GPUCommon *common, SoftCompute::Backend *backend);
 	bool ComputeActive() const;
+	Draw::Texture *ComputeDisplayTexture(uint32_t addr, int stride, int format, int width, int height);
 
 	void SetDirty(SoftDirty flags);
 	SoftDirty GetDirty();

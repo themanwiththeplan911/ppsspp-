@@ -968,6 +968,8 @@ int main(int argc, const char* argv[]) {
 	g_Config.bSoftwareRendering = cmdLineOptions.softwareRendering.value_or(true);
 	g_Config.bSoftwareRenderingJit = true;
 	g_Config.bSoftwareRenderingCompute = !cmdLineOptions.softwareCpuRaster.value_or(false);
+	// Tests read back what was drawn after syncs, as on hardware.
+	g_Config.bSoftwareComputeLazyReadback = cmdLineOptions.softwareComputeLazy.value_or(false);
 	g_Config.iSplineBezierQuality = 2;
 	g_Config.bHighQualityDepth = true;
 	g_Config.bMemStickInserted = true;
